@@ -9,6 +9,9 @@ from sensor_msgs.msg import JointState
 from dynamixel_sdk import (
     PortHandler, PacketHandler, GroupSyncRead, GroupSyncWrite,
 )
+from dynamixel_control.arm_hardware import (
+    ARM_COMMAND_CALIBRATED, ARM_JOINT_NAMES, ARM_MOTOR_IDS,
+)
 
 
 # =========================
@@ -80,21 +83,16 @@ def _signed(value, byte_count):
     value &= (1 << bits) - 1
     return value - (1 << bits) if value >= (1 << (bits - 1)) else value
 
-# 실기 버스 스캔값 (2026-07-29). 전부 XL430-W250(model 1060).
-# ⚠️ ID→관절 대응은 **ID 오름차순 가정**이며 실측 확인 전이다.
-DEFAULT_MOTOR_IDS = [21, 22, 23, 24, 2, 15]
+
+# 2026-08-05 read-only manual encoder mapping. Gripper IDs 3/4 are owned by
+# moveit_dynamixel_bridge and are deliberately not duplicated in this legacy
+# direct-position node.
+DEFAULT_MOTOR_IDS = ARM_MOTOR_IDS
 
 # URDF(robot_arm.urdf)의 구동 관절 이름과 모터 ID 순서를 맞춤.
 # 구동 조인트는 gripper_left_pinion_joint 하나뿐 — 나머지 그리퍼 관절(우 피니언·좌우 랙)은
 # 전부 mimic 이라 여기 없다. 서보는 2개(id 3,4)지만 항상 같은 값으로 구동한다.
-DEFAULT_JOINT_NAMES = [
-    "arm_joint_1",
-    "arm_joint_2",
-    "arm_joint_3",
-    "arm_joint_4",
-    "arm_joint_5",
-    "gripper_left_pinion_joint",
-]
+DEFAULT_JOINT_NAMES = ARM_JOINT_NAMES
 
 # 프로파일 가감속 기본값. **0(=최고속 즉시 이동)으로 두지 말 것** — 명령마다
 # 순간 과전류로 토크가 풀린다(HW-8 실기 검증, 재현율 100%, 명령 후 0.3초 내 트립).
@@ -105,6 +103,11 @@ DEFAULT_PROFILE_VELOCITY = 80
 class DynamixelPositionNode(Node):
     def __init__(self):
         super().__init__("dynamixel_position_node")
+
+        if not ARM_COMMAND_CALIBRATED:
+            raise RuntimeError(
+                "Direct Dynamixel writes blocked until center tick, direction, "
+                "limits, and fixed yaw are calibrated")
 
         self.declare_parameter("port", DEVICENAME)
         self.declare_parameter("baudrate", BAUDRATE)

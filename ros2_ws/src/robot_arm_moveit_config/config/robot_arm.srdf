@@ -22,7 +22,6 @@
         <joint name="gripper_left_pinion_joint"/>
     </group>
     <group_state name="home" group="arm">
-        <joint name="arm_joint_1" value="0"/>
         <joint name="arm_joint_2" value="0"/>
         <joint name="arm_joint_3" value="0"/>
         <joint name="arm_joint_4" value="0"/>
@@ -35,7 +34,6 @@
          ⚠️ 파워트레인 문서 §6 은 all-zero home 을 production 에서 금지한다 — 양 팀 합의 전까지
          실차 연동 금지. 근거·회피책은 arm_fsm_node.py 의 stow_joint_positions 주석 참고. -->
     <group_state name="stow" group="arm">
-        <joint name="arm_joint_1" value="0"/>
         <joint name="arm_joint_2" value="0"/>
         <joint name="arm_joint_3" value="0"/>
         <joint name="arm_joint_4" value="0"/>

@@ -29,19 +29,24 @@ from rclpy.node import Node
 from std_msgs.msg import Int32MultiArray, String
 from sensor_msgs.msg import JointState
 from control_msgs.msg import JointJog
+from dynamixel_control.arm_hardware import (
+    ARM_CENTERS, ARM_DIRECTIONS, ARM_JOINT_NAMES, ARM_LIMIT_ENABLED,
+    ARM_MAX_RADS, ARM_MIN_RADS, ARM_MOTOR_IDS,
+)
 
 
 TICKS_PER_RAD = 4096.0 / (2.0 * math.pi)
 DXL_MIN_TICK = 0
 DXL_MAX_TICK = 4095
 
-DEFAULT_JOINT_NAMES = ["arm_joint_1", "arm_joint_2", "arm_joint_3"]
-DEFAULT_MOTOR_IDS = [0, 1, 2]
-DEFAULT_CENTERS = [2048, 2048, 2048]
-DEFAULT_DIRECTIONS = [1, 1, 1]
-DEFAULT_LIMIT_ENABLED = [True, True, True]
-DEFAULT_MIN_RADS = [-math.pi, -math.pi, 0.0]
-DEFAULT_MAX_RADS = [math.pi, 0.0, math.pi]
+DEFAULT_JOINT_NAMES = ARM_JOINT_NAMES
+DEFAULT_MOTOR_IDS = ARM_MOTOR_IDS
+DEFAULT_CENTERS = ARM_CENTERS
+DEFAULT_DIRECTIONS = ARM_DIRECTIONS
+DEFAULT_LIMIT_ENABLED = ARM_LIMIT_ENABLED
+DEFAULT_MIN_RADS = ARM_MIN_RADS
+DEFAULT_MAX_RADS = ARM_MAX_RADS
+
 
 class TeleopCore(Node):
     def __init__(self):

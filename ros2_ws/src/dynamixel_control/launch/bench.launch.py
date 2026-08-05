@@ -2,7 +2,7 @@
 
 기동 대상:
   - joy_node        : 게임패드 → /joy
-  - joystick_teleop : /joy → /arm/teleop_jog (5축 직접 매핑)
+  - joystick_teleop : /joy → /arm/teleop_jog (활성 4축 직접 매핑)
   - teleop_core     : /arm/teleop_jog → /dynamixel/goal_position
   - position_node   : use_hardware:=true 일 때만 (실서보, /dev/ttyUSB0)
   - robot_state_publisher + rviz2 : rviz:=true 일 때만

@@ -1009,11 +1009,14 @@
     <parent link="link_002" />
     <child link="link_003" />
   </joint>
-  <joint name="arm_joint_1" type="continuous">
+  <!-- arm_joint_1 motor was removed and the arm base is fixed to the chassis.
+       TODO(HW): measure the installed fixed yaw.  rpy=0 preserves the CAD-zero
+       transform only; it is not a measured chassis yaw and motion remains
+       software-blocked until that calibration is recorded. -->
+  <joint name="arm_joint_1" type="fixed">
     <origin xyz="0.0 0.0 0.0465" rpy="0 0 0" />
     <parent link="link_002" />
     <child link="link_004" />
-    <axis xyz="0.0 0.0 1.0" />
   </joint>
   <joint name="fixed_joint_004" type="fixed">
     <origin xyz="0.0 -0.01 0.0085" rpy="0 0 0" />

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""조이스틱(DualSense) 원격조종 프론트엔드 — 5축 직접 매핑.
+"""조이스틱(DualSense) 원격조종 프론트엔드 — 활성 4축 직접 매핑.
 
 `/joy`(sensor_msgs/Joy)를 표준 control_msgs/JointJog(+ 이산 명령 String)로 변환해
 teleop_core 로 보낸다. 시리얼/모터 로직은 전혀 없다 — 순수 입력 어댑터.
@@ -7,7 +7,6 @@ teleop_core 로 보낸다. 시리얼/모터 로직은 전혀 없다 — 순수 �
 
 키맵 (2026-07-29 DualSense 블루투스 실측 — 축·버튼 인덱스는 전부 파라미터)
   buttons[9] (hold)  데드맨. 누르고 있는 동안만 움직인다. 떼면 전 축 즉시 0.
-  왼스틱  ↔ (axes 0)  arm_joint_1
   왼스틱  ↕ (axes 1)  arm_joint_2
   오른스틱 ↕ (axes 3) arm_joint_3
   오른스틱 ↔ (axes 2) arm_joint_4
@@ -34,24 +33,22 @@ from rclpy.node import Node
 from sensor_msgs.msg import Joy
 from std_msgs.msg import String
 from control_msgs.msg import JointJog
+from dynamixel_control.arm_hardware import ARM_JOINT_NAMES
 
 
-DEFAULT_JOINT_NAMES = [
-    'arm_joint_1', 'arm_joint_2', 'arm_joint_3', 'arm_joint_4', 'arm_joint_5',
-    'gripper_left_pinion_joint',
-]
+DEFAULT_JOINT_NAMES = ARM_JOINT_NAMES + ['gripper_left_pinion_joint']
 
 #: 관절별 축 인덱스. -1 = 축 없음(버튼으로 조작).
 #: 실측(2026-07-29, DualSense BT + joy 3.3): 0=왼스틱X, 1=왼스틱Y,
 #: 2=오른스틱X, 3=오른스틱Y, 4=L2, 5=R2 — joy 문서의 표준 배치와 다르다.
 #: (표준은 2=L2, 3=오른스틱X, 4=오른스틱Y 다. 이 패드는 legacy joydev 배치.)
-DEFAULT_AXIS_IDS = [0, 1, 3, 2, -1, -1]
+DEFAULT_AXIS_IDS = [1, 3, 2, -1, -1]
 
 #: 풀 스틱일 때의 속도 [rad/s]. teleop_core 가 velocities 를 rad/s 로 해석한다.
-DEFAULT_AXIS_SCALES = [0.6, 0.4, 0.4, 0.6, 0.8, 0.5]
+DEFAULT_AXIS_SCALES = [0.4, 0.4, 0.6, 0.8, 0.5]
 
 #: 축 방향 반전. 스틱을 위로 밀었을 때 관절이 의도한 방향으로 가도록.
-DEFAULT_AXIS_INVERTED = [False, True, False, False, False, False]
+DEFAULT_AXIS_INVERTED = [True, False, False, False, False]
 
 #: 축이 없는 관절(-1)을 굴릴 버튼. 관절별로 따로 둔다 — 예전엔 joint5_plus/minus
 #: 하나를 축 없는 **모든** 관절이 공유해서, 손목과 그리퍼가 같이 움직였다.
@@ -60,8 +57,8 @@ DEFAULT_AXIS_INVERTED = [False, True, False, False, False, False]
 #: 그리퍼를 L2/R2 **축**(4·5)에 물리지 않은 이유: 이 패드의 트리거 축은 안 누른
 #: 상태에서 **+1.0** 을 낸다(첫 조작 전에만 0.0). 축으로 쓰면 아무도 안 만졌는데
 #: 그리퍼가 풀속으로 돈다.
-DEFAULT_BUTTON_PLUS_IDS = [-1, -1, -1, -1, 2, 3]
-DEFAULT_BUTTON_MINUS_IDS = [-1, -1, -1, -1, 0, 1]
+DEFAULT_BUTTON_PLUS_IDS = [-1, -1, -1, 2, 3]
+DEFAULT_BUTTON_MINUS_IDS = [-1, -1, -1, 0, 1]
 
 
 class JoystickTeleop(Node):

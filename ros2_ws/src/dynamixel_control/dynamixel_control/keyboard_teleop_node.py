@@ -27,6 +27,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 from control_msgs.msg import JointJog
+from dynamixel_control.arm_hardware import ARM_JOINT_NAMES
 
 
 HELP = __doc__
@@ -36,9 +37,7 @@ class KeyboardTeleop(Node):
     def __init__(self):
         super().__init__("keyboard_teleop")
 
-        self.declare_parameter(
-            "joint_names", ["arm_joint_1", "arm_joint_2", "arm_joint_3"]
-        )
+        self.declare_parameter("joint_names", ARM_JOINT_NAMES)
         self.declare_parameter("step_scale", 1.0)   # displacement 크기 배율
         self.declare_parameter("step_scale_delta", 0.5)
 

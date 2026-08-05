@@ -111,7 +111,6 @@ from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.time import Time
-from rclpy.duration import Duration as RclpyDuration
 from tf2_ros import Buffer, TransformListener, TransformException
 from tf2_geometry_msgs import do_transform_pose
 
@@ -128,17 +127,15 @@ from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from robot_arm_msgs.msg import ArrivalStatus, ChassisMode, ArmStatus, DetectedObject
 from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
+from dynamixel_control.arm_hardware import ARM_JOINT_NAMES, load_srdf_group_state
+
+
+ANALYTIC_JOINT_NAMES = []
 
 
 # 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf) 기준 — URDF 자체는
-# 팔 5축(arm_joint_1~5)을 전부 반영하지만, analytic IK(FK+수치 자코비안)는 아직 앞의
-# 3관절만 풀도록 남겨둠(HW-7 당시 6DOF pose goal이 NO_IK_SOLUTION이던 문제 회피용으로
-# 도입된 3DOF 위치전용 IK — URDF가 3축만 있어서가 아니라 solver를 아직 5DOF로 확장 안
-# 해서임, 방향은 여전히 무시). MoveGroup 경로(§6 결정 '가')는 남겨두되 ik_mode:='moveit'로
-# 전환 가능하게만 유지.
-ARM_JOINT_NAMES = ['arm_joint_1', 'arm_joint_2', 'arm_joint_3']
-
-
+# arm_joint_1이 차체에 고정된 4DOF 실기에서는 과거의 analytic fallback이 잘못된
+# 관절 의미를 사용한다. 기본 및 유일한 실행 경로는 MoveIt이다.
 # ──────────────────────────────────────────────
 # status / mode 문자열 — 단일 출처는 contract.py (파워트레인 contract.py 와 짝).
 # 여기서 상수를 새로 정의하지 말 것. 어휘 변경은 양 팀 합의 사항이다.
@@ -224,11 +221,13 @@ class ArmFsmNode(Node):
         self.declare_parameter('pick_frame_id', 'camera_color_optical_frame')
         self.declare_parameter('pos_tolerance', 0.01)            # [m]
         self.declare_parameter('orient_tolerance', 0.1)          # [rad]
+        # Fixed-yaw 4DOF cannot generally satisfy arbitrary 6D poses.
+        self.declare_parameter('constrain_orientation', False)
         self.declare_parameter('planning_time', 5.0)
         self.declare_parameter('vel_scale', 0.1)                 # 저속(파지 안전)
         self.declare_parameter('acc_scale', 0.1)
-        # 'analytic'(기본, URDF 3관절 한정 수치 IK) | 'moveit'(URDF 5축 완성 후 전환)
-        self.declare_parameter('ik_mode', 'analytic')
+        # 4축 실기 실행 경로는 MoveIt만 허용한다.
+        self.declare_parameter('ik_mode', 'moveit')
         self.declare_parameter('ik_max_iters', 8)
         self.declare_parameter('ik_tol', 0.01)          # [m] 위치 수렴 허용오차
         self.declare_parameter('ik_accept_tol', 0.03)   # [m] 최종 실패 판정 기준
@@ -262,7 +261,7 @@ class ArmFsmNode(Node):
         self.declare_parameter('locked_pos_tol', 0.005)   # [m] tip 위치 흔들림 허용치
         self.declare_parameter('locked_vel_tol', 0.05)    # [rad/s] 관절 속도(유한차분) 허용치
         self.declare_parameter('locked_dwell', 0.5)       # [s] 안정 유지 시간
-        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 = j1, j2, j3).
+        # STOWING 목표 관절각(ARM_JOINT_NAMES 순서 = j2..j5).
         # **팀이 주행 안정성 기준으로 all-zero 를 접힘 자세로 확정**(사용자 지시, 2026-07-29).
         # 2026-07-29 랙피니언 그리퍼 URDF 실측 지표:
         #   점유 bbox x 224mm × y 606mm   높이 285mm   최저점 +50mm
@@ -285,7 +284,8 @@ class ArmFsmNode(Node):
         #
         # 이전 기본값 [0.0, -0.6, 1.2]은 j2=-0.6이 URDF 하한(0) 밖이라 애초에 도달 불가였다.
         # ⚠️ URDF 검증만 끝났고 실기 검증은 아직 — 실물 구동 전 서보 tick 대응 확인 필요.
-        self.declare_parameter('stow_joint_positions', [0.0, 0.0, 0.0])
+        srdf_stow = load_srdf_group_state('arm', 'stow')
+        self.declare_parameter('stow_joint_positions', srdf_stow)
         # STOWED_LOCKED 발행 전 "실제로 접힌 자세인지" 확인용 관절각 허용오차 — §5.1 잔여
         # 합의 ②(정지 안정성만 검사하고 접힘 자세 근접은 미확인) 대응. LOCKED 경유(지형/주행
         # 이벤트로 작업 중단)로 도달한 임의 자세를 STOWED_LOCKED로 착칭하지 않기 위함.
@@ -300,10 +300,16 @@ class ArmFsmNode(Node):
         self.pick_frame_id = g('pick_frame_id').value
         self.pos_tol = g('pos_tolerance').value
         self.orient_tol = g('orient_tolerance').value
+        self.constrain_orientation = bool(
+            g('constrain_orientation').value)
         self.planning_time = g('planning_time').value
         self.vel_scale = g('vel_scale').value
         self.acc_scale = g('acc_scale').value
         self.ik_mode = g('ik_mode').value
+        if self.ik_mode != 'moveit':
+            raise RuntimeError(
+                "analytic IK is disabled for the fixed-yaw four-axis arm; "
+                "ik_mode must be 'moveit'")
         self.ik_max_iters = int(g('ik_max_iters').value)
         self.ik_tol = g('ik_tol').value
         self.ik_accept_tol = g('ik_accept_tol').value
@@ -337,13 +343,14 @@ class ArmFsmNode(Node):
         latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(DetectedObject, '/pick_target', self._on_pick_target, latched)
         self.create_subscription(ArrivalStatus, '/arrival_status', self._on_arrival, ARRIVAL_QOS)
-        self.create_subscription(ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
+        self.create_subscription(
+            ChassisMode, '/chassis_mode', self._on_chassis_mode, HEARTBEAT_QOS)
         self.create_subscription(JointState, '/joint_states', self._on_joint_states, 10)
         # 계약 §5.1 "locked heartbeat는 ... controller fault 0 ... 을 실제 확인한다" —
         # moveit_dynamixel_bridge가 Hardware Error Status를 집계해 발행(내부용 토픽,
         # 파워트레인 DDS 경계를 넘지 않음). _is_settled()에서 게이트로 사용.
-        self.create_subscription(Bool, '/dynamixel/controller_fault',
-                                  self._on_controller_fault, 10)
+        self.create_subscription(
+            Bool, '/dynamixel/controller_fault', self._on_controller_fault, 10)
 
         self.pub_status = self.create_publisher(ArmStatus, '/arm_status', HEARTBEAT_QOS)
 
@@ -351,21 +358,23 @@ class ArmFsmNode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        self._move = ActionClient(self, MoveGroup, 'move_action')          # MoveIt (ik_mode=='moveit')
+        # MoveIt plan-and-execute path (ik_mode == 'moveit').
+        self._move = ActionClient(self, MoveGroup, 'move_action')
+        self._direct_arm = ActionClient(
+            self, FollowJointTrajectory,
+            '/arm_controller/follow_joint_trajectory')
         self._grip = ActionClient(self, FollowJointTrajectory,
                                   '/gripper_controller/follow_joint_trajectory')
 
-        # analytic IK 경로 (ik_mode=='analytic', 기본): FK 서비스 + 직접 관절궤적 publish
+        # Legacy FK client remains for code-level diagnostics only. Analytic
+        # motion is blocked above because its old joint semantics are unsafe.
         # ⚠️ FK 호출은 _tick(타이머 콜백) 안에서 블로킹 대기함 — self 를 spin하면 이미
         # 실행 중인 콜백을 재진입 spin 하게 되어 응답을 못 받고 타임아웃(실측 확인:
         # 독립 스크립트로는 2회 반복만에 수렴하는데 노드 내부에서는 즉시 실패).
         # 별도 헬퍼 노드/이그제큐터로 분리해서 우회.
         self._fk_node = rclpy.create_node('arm_fsm_fk_client')
         self._fk_client = self._fk_node.create_client(GetPositionFK, '/compute_fk')
-        self._arm_traj_pub = self.create_publisher(
-            JointTrajectory, '/arm_controller/joint_trajectory', 10)
         self._joint_position = {}          # joint_name -> position(rad), /joint_states 에서 갱신
-        self._arm_move_deadline = None      # analytic 이동 완료 예상 시각
 
         # ── 내부 상태 ─────────────────────────────
         # 빈손으로 접혀 잠긴 평상시 상태. 외부 heartbeat의 STOWED_LOCKED와 내부 FSM
@@ -553,10 +562,6 @@ class ArmFsmNode(Node):
 
     def _tick(self):
         self._check_chassis_mode_watchdog()
-        if (self._motion_state == 'active' and self._arm_move_deadline is not None
-                and self.get_clock().now() >= self._arm_move_deadline):
-            self._motion_state = 'done'
-            self._arm_move_deadline = None
         handler = getattr(self, f'_do_{self.state.name.lower()}', None)
         if handler:
             handler()
@@ -942,7 +947,6 @@ class ArmFsmNode(Node):
         if self._arm_goal_handle is not None:
             self._arm_goal_handle.cancel_goal_async()
             self._arm_goal_handle = None
-        self._arm_move_deadline = None
         self._motion_state = 'idle'
 
     def _build_move_group_goal(self, pose_stamped):
@@ -977,7 +981,8 @@ class ArmFsmNode(Node):
 
         constraints = Constraints()
         constraints.position_constraints.append(pc)
-        constraints.orientation_constraints.append(oc)
+        if self.constrain_orientation:
+            constraints.orientation_constraints.append(oc)
         req.goal_constraints.append(constraints)
 
         goal = MoveGroup.Goal()
@@ -1078,7 +1083,7 @@ class ArmFsmNode(Node):
         req.header.frame_id = self.base_frame
         req.fk_link_names = [self.tip_link]
         req.robot_state = RobotState()
-        req.robot_state.joint_state.name = list(ARM_JOINT_NAMES)
+        req.robot_state.joint_state.name = list(ANALYTIC_JOINT_NAMES)
         req.robot_state.joint_state.position = [float(v) for v in q]
         if not self._fk_client.service_is_ready():
             return None
@@ -1093,10 +1098,9 @@ class ArmFsmNode(Node):
     def _solve_position_ik(self, target_xyz, q_init):
         """FK + 수치 자코비안(finite-difference) 로 위치만 맞추는 3DOF IK.
 
-        ARM_JOINT_NAMES가 앞 3관절(arm_joint_1~3)만 써서 MoveIt 6DOF pose IK 대신 이 방식을
-        기본으로 씀(HW-7 실측 확인, compute_ik가 현재 실제 tip pose에도 NO_IK_SOLUTION 반환하던
-        문제 회피 — URDF 자체는 5축 다 있음, solver가 아직 5DOF로 확장 안 됨). 방향은 포기하고
-        위치만 댐핑 최소자승(Levenberg-Marquardt 유사)으로 반복 수렴.
+        ANALYTIC_JOINT_NAMES의 앞 3관절만 푼다. 이 경로는 진단 fallback이며,
+        실제 5축 기본 경로는 MoveIt이다. 방향은 포기하고 위치만 댐핑 최소자승으로
+        반복 수렴하며, 관절 4/5는 측정 위치를 유지한다.
         """
         q = np.array(q_init, dtype=float)
         target = np.array(target_xyz, dtype=float)
@@ -1134,23 +1138,16 @@ class ArmFsmNode(Node):
         return None
 
     def _move_to_xyz(self, target_xyz):
-        """target_xyz(base_frame) 로 analytic IK 계산 → /arm_controller/joint_trajectory 직접 발행."""
-        q_current = self._current_arm_joint_positions()
-        solution = self._solve_position_ik(target_xyz, q_current)
-        if solution is None:
-            self.get_logger().warn(f'analytic IK 실패 — 목표 도달 불가: {target_xyz}')
-            return False
-        self._publish_joint_trajectory(solution, q_current)
-        self.get_logger().info(
-            f'analytic IK: {[round(v, 3) for v in solution]} rad 로 이동')
-        return True
+        """Reject the obsolete analytic motion path on the four-axis arm."""
+        self.get_logger().error(
+            f'analytic IK disabled for fixed-yaw four-axis hardware: {target_xyz}')
+        return False
 
     def _begin_stow_move(self):
         """`stow_joint_positions` 목표로 직접 관절궤적 발행 (MoveIt 미경유).
 
-        접힘 자세는 충돌 회피가 필요 없는 known-safe 설정값이라 가정하므로(실측 후
-        캘리브 전제), ik_mode와 무관하게 항상 `_arm_traj_pub`로 직접 명령한다 —
-        analytic IK를 거칠 필요가 없다(목표가 이미 관절각이지 xyz가 아님).
+        SRDF의 `arm/stow` group state에서 읽은 4축 목표를 arm controller action으로
+        실행한다. analytic IK는 거치지 않으며 실제 feedback 목표 도달 결과를 기다린다.
         """
         q_current = self._current_arm_joint_positions()
         self._publish_joint_trajectory(self.stow_joint_positions, q_current)
@@ -1166,12 +1163,32 @@ class ArmFsmNode(Node):
         pt.positions = [float(v) for v in target_positions]
         pt.time_from_start = Duration(sec=int(duration))
         traj.points.append(pt)
-        self._arm_traj_pub.publish(traj)
-
         self._motion_state = 'active'
-        self._motion_ok = True
-        self._arm_move_deadline = self.get_clock().now() + RclpyDuration(
-            seconds=duration + 0.5)
+        self._motion_ok = False
+        goal = FollowJointTrajectory.Goal()
+        goal.trajectory = traj
+        if not self._direct_arm.server_is_ready():
+            self.get_logger().warn('arm_controller action server 미준비')
+        self._direct_arm.send_goal_async(goal).add_done_callback(
+            self._on_direct_arm_goal_response)
+
+    def _on_direct_arm_goal_response(self, future):
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self._motion_state = 'done'
+            self._motion_ok = False
+            return
+        self._arm_goal_handle = goal_handle
+        goal_handle.get_result_async().add_done_callback(
+            self._on_direct_arm_result)
+
+    def _on_direct_arm_result(self, future):
+        wrapped = future.result()
+        self._motion_ok = (
+            wrapped.result.error_code
+            == FollowJointTrajectory.Result.SUCCESSFUL)
+        self._motion_state = 'done'
+        self._arm_goal_handle = None
 
     # ── 그리퍼 ─────────────────────────────────
 
