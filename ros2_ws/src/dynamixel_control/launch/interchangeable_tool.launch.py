@@ -16,6 +16,11 @@ def generate_launch_description():
     read_only = LaunchConfiguration('read_only')
     control_scope = LaunchConfiguration('control_scope')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
+    temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
+    temporary_safe_min = LaunchConfiguration('temporary_jog_safe_min_tick')
+    temporary_safe_max = LaunchConfiguration('temporary_jog_safe_max_tick')
+    mechanical_open = LaunchConfiguration('temporary_jog_mechanical_open_tick')
+    mechanical_close = LaunchConfiguration('temporary_jog_mechanical_close_tick')
     cleaner_joint = LaunchConfiguration('cleaning_actuator_joint')
     cleaner_id = LaunchConfiguration('cleaning_actuator_id')
     cleaner_direction = LaunchConfiguration('cleaning_direction')
@@ -36,6 +41,13 @@ def generate_launch_description():
         DeclareLaunchArgument('control_scope', default_value='FULL_ROBOT'),
         DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
+        DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
+        DeclareLaunchArgument('temporary_jog_safe_min_tick', default_value='2867'),
+        DeclareLaunchArgument('temporary_jog_safe_max_tick', default_value='3807'),
+        DeclareLaunchArgument(
+            'temporary_jog_mechanical_open_tick', default_value='2817'),
+        DeclareLaunchArgument(
+            'temporary_jog_mechanical_close_tick', default_value='3857'),
         DeclareLaunchArgument('cleaning_actuator_joint', default_value=''),
         DeclareLaunchArgument('cleaning_actuator_id', default_value='-1'),
         DeclareLaunchArgument('cleaning_direction', default_value='0'),
@@ -49,6 +61,16 @@ def generate_launch_description():
                 'control_scope': control_scope,
                 'gripper_target_tolerance_ticks': ParameterValue(
                     gripper_tolerance, value_type=int),
+                'temporary_jog_mode': ParameterValue(
+                    temporary_jog_mode, value_type=bool),
+                'temporary_jog_safe_min_tick': ParameterValue(
+                    temporary_safe_min, value_type=int),
+                'temporary_jog_safe_max_tick': ParameterValue(
+                    temporary_safe_max, value_type=int),
+                'temporary_jog_mechanical_open_tick': ParameterValue(
+                    mechanical_open, value_type=int),
+                'temporary_jog_mechanical_close_tick': ParameterValue(
+                    mechanical_close, value_type=int),
                 'cleaning_actuator_joint': cleaner_joint,
                 'cleaning_actuator_id': ParameterValue(cleaner_id, value_type=int),
                 'cleaning_direction': ParameterValue(

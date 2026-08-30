@@ -39,10 +39,21 @@ class ManualGuiNode(Node):
         self.declare_parameter('mock_mode', False)
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         self.declare_parameter('control_scope', 'FULL_ROBOT')
+        self.declare_parameter('temporary_jog_mode', False)
+        self.declare_parameter('temporary_jog_safe_min_tick', 2867)
+        self.declare_parameter('temporary_jog_safe_max_tick', 3807)
+        self.declare_parameter('temporary_jog_mechanical_open_tick', 2817)
+        self.declare_parameter('temporary_jog_mechanical_close_tick', 3857)
         self.mock_mode = bool(self.get_parameter('mock_mode').value)
         self.selected_tool = str(self.get_parameter('tool_type').value)
         self.control_scope = validate_control_scope(
             self.get_parameter('control_scope').value)
+        self.temporary_jog_mode = bool(
+            self.get_parameter('temporary_jog_mode').value)
+        self.temporary_jog_safe_min = int(
+            self.get_parameter('temporary_jog_safe_min_tick').value)
+        self.temporary_jog_safe_max = int(
+            self.get_parameter('temporary_jog_safe_max_tick').value)
         self.positions = {name: 0.0 for name in ARM_JOINTS}
         self.efforts = {name: 0.0 for name in ARM_JOINTS}
         self.control_mode = 'FSM'
@@ -135,6 +146,16 @@ class ManualGuiNode(Node):
         if self.gripper_busy:
             self.signals.log.emit('Gripper command blocked: BUSY')
             return False
+        if (self.temporary_jog_mode and self.control_scope == 'END_EFFECTOR_ONLY'
+                and self.selected_tool == 'spur_1motor_gripper'):
+            target = int(round(position))
+            if not (self.temporary_jog_safe_min <= target
+                    <= self.temporary_jog_safe_max):
+                self.signals.log.emit(
+                    f'Gripper jog blocked: target={target} outside '
+                    f'[{self.temporary_jog_safe_min}, '
+                    f'{self.temporary_jog_safe_max}]')
+                return False
         goal = FollowJointTrajectory.Goal()
         goal.trajectory.joint_names = ['gripper_drive_joint']
         point = JointTrajectoryPoint()

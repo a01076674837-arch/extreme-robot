@@ -37,6 +37,17 @@ class ManualMainWindow(QMainWindow):
         self.arm_widgets = {}
         self.gripper_busy = False
         self.gripper_target_ticks = {}
+        self.temporary_jog_safe_min = getattr(
+            self.node, 'temporary_jog_safe_min', 2867)
+        self.temporary_jog_safe_max = getattr(
+            self.node, 'temporary_jog_safe_max', 3807)
+        get_param = getattr(self.node, 'get_parameter', None)
+        self.temporary_jog_mechanical_open = (
+            get_param('temporary_jog_mechanical_open_tick').value
+            if get_param else 2817)
+        self.temporary_jog_mechanical_close = (
+            get_param('temporary_jog_mechanical_close_tick').value
+            if get_param else 3857)
         self.setWindowTitle('Extreme Robot Manual Hardware Validation')
         self.resize(1180, 850)
         self._build_ui()
@@ -191,8 +202,12 @@ class ManualMainWindow(QMainWindow):
         layout.addLayout(row)
         jog = QGroupBox('GRIPPER JOG')
         jog_layout = QGridLayout(jog)
-        self.jog_close = QPushButton('LEFT / −  (CLOSE)')
-        self.jog_open = QPushButton('RIGHT / +  (OPEN)')
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            left_label, right_label = 'LEFT / −  (OPEN)', 'RIGHT / +  (CLOSE)'
+        else:
+            left_label, right_label = 'LEFT / −  (CLOSE)', 'RIGHT / +  (OPEN)'
+        self.jog_close = QPushButton(left_label)
+        self.jog_open = QPushButton(right_label)
         self.gripper_jog_step = QComboBox()
         self.gripper_jog_step.addItems(['5', '10', '25', '50'])
         self.gripper_busy_label = QLabel('READY')
@@ -212,7 +227,16 @@ class ManualMainWindow(QMainWindow):
         jog_layout.addWidget(self.gripper_busy_label, 2, 0, 1, 2)
         jog_layout.addWidget(self.gripper_position_label, 3, 0, 1, 2)
         jog_layout.addWidget(self.gripper_feedback_label, 4, 0, 1, 2)
-        jog_layout.addWidget(shortcut, 5, 0, 1, 2)
+        shortcut_row = 5
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            jog_layout.addWidget(QLabel(
+                f'Safe range: {self.temporary_jog_safe_min} ~ '
+                f'{self.temporary_jog_safe_max}\n'
+                f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
+                f'{self.temporary_jog_mechanical_close}\n'
+                'Direction: OPEN ← [−]   [+] → CLOSE'), 5, 0, 1, 2)
+            shortcut_row = 6
+        jog_layout.addWidget(shortcut, shortcut_row, 0, 1, 2)
         layout.addWidget(jog)
         cleaner = QHBoxLayout()
         self.clean_start = QPushButton('CLEANER START')
@@ -316,12 +340,27 @@ class ManualMainWindow(QMainWindow):
         self.tool_stop.setEnabled(
             manual and gripper and profile_ok
             and (self.gripper_busy or motion))
-        jog_ready = (preset_ready
+        jog_ready = (manual and not self.gripper_busy
                      and self.node.control_scope == 'END_EFFECTOR_ONLY'
-                     and self.node.selected_tool == 'dual_motor_gripper'
+                     and self.node.selected_tool in (
+                         'dual_motor_gripper', 'spur_1motor_gripper')
+                     and self._tool_motion_ready()
                      and self._gripper_positions_synchronized())
-        self.jog_close.setEnabled(jog_ready)
-        self.jog_open.setEnabled(jog_ready)
+        # When the measured position is outside the temporary range, expose
+        # only the inward recovery direction.  This prevents a disabled
+        # direction from being retried by either a click or a key shortcut.
+        spur_open_allowed = True   # LEFT / '-' decreases ticks (opens)
+        spur_close_allowed = True  # RIGHT / '+' increases ticks (closes)
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            sample = self._gripper_samples().get(5, {})
+            current = sample.get('position')
+            if current is not None:
+                if current > self.temporary_jog_safe_max:
+                    spur_close_allowed = False
+                elif current < self.temporary_jog_safe_min:
+                    spur_open_allowed = False
+        self.jog_close.setEnabled(jog_ready and spur_open_allowed)
+        self.jog_open.setEnabled(jog_ready and spur_close_allowed)
         self.gripper_jog_step.setEnabled(not self.gripper_busy)
         cleaner = self.node.selected_tool == 'cleaner'
         configured = bool(self.tool_status.get('actuators_discovered'))
@@ -340,9 +379,13 @@ class ManualMainWindow(QMainWindow):
         online_ids = {sample.get('id') for sample in samples
                       if sample.get('online')}
         actuators_ok = bool(expected_ids) and online_ids == expected_ids
+        profile_ready = bool(self.tool_status.get('profile_valid')) \
+            and bool(self.tool_status.get('calibrated'))
+        temporary_ready = bool(self.tool_status.get('temporary_jog_ready')) \
+            and self.node.temporary_jog_mode
         return (fresh and bool(self.tool_status.get('bridge_connected'))
                 and bool(self.tool_status.get('motion_allowed')) and scope_ok
-                and actuators_ok and bool(self.tool_status.get('calibrated'))
+                and actuators_ok and (profile_ready or temporary_ready)
                 and not bool(self.tool_status.get('read_only'))
                 and not bool(self.tool_status.get('emergency_stop'))
                 and not bool(self.tool_status.get('tool_detached')))
@@ -380,12 +423,32 @@ class ManualMainWindow(QMainWindow):
         return fractions
 
     def _gripper_positions_synchronized(self):
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            sample = self._gripper_samples().get(5, {})
+            return sample.get('position') is not None and bool(sample.get('online'))
         fractions = self._normalized_positions()
         return (len(fractions) == len(self.profile.get('actuator_ids', []))
                 and max(fractions.values()) - min(fractions.values()) <= 0.05)
 
     def _update_gripper_feedback(self):
         samples = self._gripper_samples()
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            sample = samples.get(5, {})
+            current = sample.get('position')
+            target = self.gripper_target_ticks.get(5)
+            error = None if current is None or target is None else target - current
+            self.gripper_position_label.setText(
+                f'Spur Gripper | Current: {current} | Target: {target} '
+                f'| Error: {error}')
+            self.gripper_feedback_label.setText(
+                f'ID5: current={current}, target={target}, error={error}, '
+                f'current/load={sample.get("effort")}, '
+                f'online={sample.get("online", False)}\n'
+                f'Safe range: {self.temporary_jog_safe_min} ~ '
+                f'{self.temporary_jog_safe_max}\n'
+                f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
+                f'{self.temporary_jog_mechanical_close}')
+            return
         fractions = self._normalized_positions()
         if fractions:
             normalized = sum(fractions.values()) / len(fractions)
@@ -415,6 +478,9 @@ class ManualMainWindow(QMainWindow):
         reason = self._gripper_jog_block_reason()
         if reason:
             self._append_log(f'Gripper jog blocked: {reason}')
+            return
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            self._jog_spur(direction)
             return
         endpoints = self._motor_endpoints()
         fractions = self._normalized_positions()
@@ -460,19 +526,44 @@ class ManualMainWindow(QMainWindow):
     def _gripper_jog_block_reason(self):
         if self.node.control_scope != 'END_EFFECTOR_ONLY':
             return 'control scope is not END_EFFECTOR_ONLY'
-        if self.node.selected_tool != 'dual_motor_gripper':
-            return 'selected tool is not dual_motor_gripper'
+        if self.node.selected_tool not in (
+                'dual_motor_gripper', 'spur_1motor_gripper'):
+            return 'selected tool is not a supported gripper'
         if self.control_mode != 'MANUAL':
             return 'ownership is not MANUAL'
         if self.gripper_busy or self.node.gripper_busy:
             return 'BUSY'
         if not self._tool_motion_ready():
             return 'bridge/tool safety status is not ready or fresh'
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            sample = self._gripper_samples().get(5, {})
+            if sample.get('position') is None or not sample.get('online'):
+                return 'ID5 position/online feedback unavailable'
+            return ''
         if not self._normalized_positions():
             return 'current actuator positions are unavailable'
         if not self._gripper_positions_synchronized():
             return 'motor normalized positions are not synchronized'
         return ''
+
+    def _jog_spur(self, direction):
+        sample = self._gripper_samples().get(5, {})
+        current = sample.get('position')
+        step = int(self.gripper_jog_step.currentText())
+        # Spur mapping: decreasing ticks opens, increasing ticks closes.
+        target = int(current) + direction * step
+        in_safe = self.temporary_jog_safe_min <= target <= self.temporary_jog_safe_max
+        recovery = current < self.temporary_jog_safe_min or current > self.temporary_jog_safe_max
+        inward = ((current > self.temporary_jog_safe_max and direction < 0)
+                  or (current < self.temporary_jog_safe_min and direction > 0))
+        if (not in_safe and not (recovery and inward)):
+            self._append_log(
+                f'Spur jog blocked: target={target} outside safe range '
+                f'[{self.temporary_jog_safe_min}, {self.temporary_jog_safe_max}]')
+            return
+        if self.node.command_gripper(target):
+            self.gripper_target_ticks = {5: target}
+            self._update_gripper_feedback()
 
     def keyPressEvent(self, event):
         if event.isAutoRepeat():

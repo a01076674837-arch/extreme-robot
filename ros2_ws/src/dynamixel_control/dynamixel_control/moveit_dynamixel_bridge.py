@@ -293,6 +293,11 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("mock_mode", False)
         self.declare_parameter("tool_type", "spur_1motor_gripper")
         self.declare_parameter("control_scope", "FULL_ROBOT")
+        self.declare_parameter("temporary_jog_mode", False)
+        self.declare_parameter("temporary_jog_safe_min_tick", 2867)
+        self.declare_parameter("temporary_jog_safe_max_tick", 3807)
+        self.declare_parameter("temporary_jog_mechanical_open_tick", 2817)
+        self.declare_parameter("temporary_jog_mechanical_close_tick", 3857)
         self.declare_parameter("gripper_target_tolerance_ticks", 20)
         default_profiles = str(Path(get_package_share_directory(
             'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
@@ -308,6 +313,17 @@ class MoveItDynamixelBridge(Node):
         self.tool_type = str(self.get_parameter("tool_type").value)
         self.control_scope = validate_control_scope(
             self.get_parameter("control_scope").value)
+        self.temporary_jog_mode = bool(
+            self.get_parameter("temporary_jog_mode").value)
+        self.temporary_jog_safe_min = int(
+            self.get_parameter("temporary_jog_safe_min_tick").value)
+        self.temporary_jog_safe_max = int(
+            self.get_parameter("temporary_jog_safe_max_tick").value)
+        self.temporary_jog_enabled = bool(
+            self.temporary_jog_mode
+            and self.control_scope == 'END_EFFECTOR_ONLY'
+            and self.tool_type == 'spur_1motor_gripper'
+            and self.temporary_jog_safe_min < self.temporary_jog_safe_max)
         self.gripper_target_tolerance = int(
             self.get_parameter("gripper_target_tolerance_ticks").value)
         if self.gripper_target_tolerance < 0:
@@ -348,6 +364,10 @@ class MoveItDynamixelBridge(Node):
         self.tool_motion_allowed = bool(
             self.tool_selection and self.tool_selection.valid
             and not self.read_only and not self.mock_mode)
+        if self.temporary_jog_enabled and not self.read_only and not self.mock_mode:
+            # The calibrated profile remains invalid; temporary mode only permits
+            # the explicitly bounded single-actuator jog path below.
+            self.tool_motion_allowed = True
         self.tool_profile = (
             self.tool_selection.profile if self.tool_selection else {})
 
@@ -406,7 +426,10 @@ class MoveItDynamixelBridge(Node):
                     self.group_sync_read.addParam(dxl_id)
                     self.active_ids.add(dxl_id)
             elif self.tool_motion_allowed and self.tool_discovered:
-                self._configure_tool_actuators()
+                if self.temporary_jog_enabled:
+                    self._configure_temporary_jog_actuator()
+                else:
+                    self._configure_tool_actuators()
             elif self.tool_ids and not self.tool_discovered:
                 self.tool_motion_allowed = False
 
@@ -516,6 +539,7 @@ class MoveItDynamixelBridge(Node):
             f"cleaning_actuator={self.cleaning_actuator_joint or 'UNCONFIGURED'}, "
             f"tool_type={self.tool_type}, tool_ready={self.tool_motion_allowed}, "
             f"control_scope={self.control_scope}, "
+            f"temporary_jog={self.temporary_jog_enabled}, "
             f"read_only={self.read_only}, mock_mode={self.mock_mode})"
         )
 
@@ -747,6 +771,8 @@ class MoveItDynamixelBridge(Node):
             'backend': self.tool_profile.get('backend', 'invalid'),
             'profile_valid': bool(self.tool_selection and self.tool_selection.valid),
             'calibrated': bool(self.tool_profile.get('calibrated')),
+            'temporary_jog_mode': self.temporary_jog_enabled,
+            'temporary_jog_ready': self._tool_backend_ready(),
             'actuators_discovered': self.tool_discovered,
             'motion_allowed': self._tool_backend_ready(),
             'read_only': self.read_only, 'mock_mode': self.mock_mode,
@@ -775,12 +801,28 @@ class MoveItDynamixelBridge(Node):
     def _tool_backend_ready(self):
         if self.mock_mode:
             return True
+        profile_ready = bool(self.tool_selection and self.tool_selection.valid
+                             and self.tool_profile.get('calibrated'))
+        temporary_ready = bool(
+            self.temporary_jog_enabled
+            and self.tool_type == 'spur_1motor_gripper'
+            and self.tool_ids == [5])
         return bool(
-            self.tool_selection and self.tool_selection.valid
-            and self.tool_profile.get('calibrated')
+            (profile_ready or temporary_ready)
             and self.tool_discovered and self._tool_actuators_online()
             and self.tool_motion_allowed and not self.read_only
             and not self.emergency_stop_active and not self.tool_detached)
+
+    def _configure_temporary_jog_actuator(self):
+        if self.tool_ids != [5]:
+            self.tool_motion_allowed = False
+            return
+        dxl_id = self.tool_ids[0]
+        if self._enable_torque(dxl_id, 'spur temporary jog'):
+            self.group_sync_read.addParam(dxl_id)
+            self.active_ids.add(dxl_id)
+        else:
+            self.tool_motion_allowed = False
 
     def _configure_cleaning_actuator(self):
         """Dynamixel Protocol 2.0 velocity mode(Operating Mode=1)로 설정한다."""
@@ -1063,9 +1105,28 @@ class MoveItDynamixelBridge(Node):
             goal_handle.succeed()
             return result
         position = float(trajectory.points[-1].positions[0])
-        open_pos = float(self.tool_profile.get('open_position', 1.0))
-        close_pos = float(self.tool_profile.get('close_position', 0.0))
+        if self.temporary_jog_enabled:
+            target = int(round(position))
+            if not (self.temporary_jog_safe_min <= target
+                    <= self.temporary_jog_safe_max):
+                result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+                result.error_string = (
+                    f'temporary jog target {target} outside '
+                    f'[{self.temporary_jog_safe_min}, '
+                    f'{self.temporary_jog_safe_max}]')
+                goal_handle.abort()
+                self.get_logger().error(result.error_string)
+                return result
+            targets = {self.tool_ids[0]: target}
+        else:
+            targets = None
+        open_pos = (1.0 if self.temporary_jog_enabled else
+                    float(self.tool_profile.get('open_position', 1.0)))
+        close_pos = (0.0 if self.temporary_jog_enabled else
+                     float(self.tool_profile.get('close_position', 0.0)))
         denominator = open_pos - close_pos
+        if self.temporary_jog_enabled:
+            denominator = 1.0
         if denominator == 0.0:
             result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
             result.error_string = 'invalid logical gripper endpoints'
@@ -1076,15 +1137,21 @@ class MoveItDynamixelBridge(Node):
             self.tool_ids[0]: {
                 'open': self.tool_profile['open_tick'],
                 'close': self.tool_profile['close_tick']}}
-        low = int(self.tool_profile['safe_min_tick'])
-        high = int(self.tool_profile['safe_max_tick'])
-        targets = {}
+        if self.temporary_jog_enabled:
+            low, high = self.temporary_jog_safe_min, self.temporary_jog_safe_max
+        else:
+            low = int(self.tool_profile['safe_min_tick'])
+            high = int(self.tool_profile['safe_max_tick'])
+        targets = targets or {}
         try:
             with self._bus_lock:
                 for dxl_id in self.tool_ids:
-                    ep = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
-                    tick = int(round(ep['close'] + ratio *
-                                     (ep['open'] - ep['close'])))
+                    if self.temporary_jog_enabled:
+                        tick = targets[dxl_id]
+                    else:
+                        ep = endpoints.get(dxl_id, endpoints.get(str(dxl_id)))
+                        tick = int(round(ep['close'] + ratio *
+                                         (ep['open'] - ep['close'])))
                     if not low <= tick <= high:
                         raise RuntimeError(
                             f'id {dxl_id} goal {tick} outside [{low},{high}]')
