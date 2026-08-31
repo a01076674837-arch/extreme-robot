@@ -128,6 +128,8 @@ from moveit_msgs.srv import GetPositionFK
 from shape_msgs.msg import SolidPrimitive
 from robot_arm_msgs.msg import (ArrivalStatus, ChassisMode, ArmStatus,
                                 DetectedObject, TaskCommand, TaskResult)
+from dynamixel_control.moveit_dynamixel_bridge import JOINT_CONFIG
+from dynamixel_control.gripper_presets import DEFAULT_GRIPPER, get_preset
 
 
 # 2026-07-15 Isaac Sim 기반 재export(robotarm_urdf_20260711.urdf) 기준 — URDF 자체는
@@ -201,8 +203,6 @@ class State(Enum):
     # 기존 파워트레인 계약에서 유지하는 감독/안전 상태.
     GRIP_LOST = auto()
     LOWER_RELEASE = auto()
-    RELEASE = auto()
-    DONE = auto()
     STOWING = auto()
     STOWED_LOCKED = auto()
     LOCKED = auto()
@@ -289,6 +289,7 @@ class ArmFsmNode(Node):
         self.declare_parameter('vla_result_topic', '/vla/result')
         self.declare_parameter('vla_standalone_mode', False)
         self.declare_parameter('dry_run_mode', False)
+        self.declare_parameter('validation_mode', False)
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         default_profiles = str(Path(get_package_share_directory(
             'dynamixel_control')) / 'config' / 'tool_profiles.yaml')
@@ -368,13 +369,15 @@ class ArmFsmNode(Node):
         self.gripper_change_mode = bool(g('gripper_change_mode').value)
         self.gripper_command_calibrated = bool(
             g('gripper_command_calibrated').value)
+        self.validation_mode = bool(g('validation_mode').value)
         # An uncalibrated preset must not even emit a gripper action goal.  The
         # bridge has the same independent guard, so ID5 remains blocked if a
         # caller bypasses this FSM.
         self.gripper_disabled = (
             self.gripper_change_mode
             or bool(g('gripper_disabled').value)
-            or not self.gripper_command_calibrated)
+            or (not self.gripper_command_calibrated
+                and not self.validation_mode))
         self.stop_after_descend = (
             self.gripper_change_mode or bool(g('stop_after_descend').value))
         self.arm_move_speed = g('arm_move_speed').value
@@ -565,8 +568,22 @@ class ArmFsmNode(Node):
                 msg.mission_id, False, self.state.name,
                 'control ownership is MANUAL')
             return
-        if command not in {'CLEAN', 'PICK', 'MOVE', 'STOP', 'STOW'}:
+        if command not in {'CLEAN', 'PICK', 'MOVE', 'STOP', 'STOW',
+                           'VALIDATE_OPEN'}:
             self._publish_task_result(msg.mission_id, False, 'REJECTED', 'unknown command')
+            return
+        if command == 'VALIDATE_OPEN':
+            if (not self.validation_mode
+                    or self.selected_tool_type != 'spur_1motor_gripper'):
+                self._publish_task_result(
+                    msg.mission_id, False, 'REJECTED',
+                    'VALIDATE_OPEN requires validation_mode + spur profile')
+                return
+            self.mission_id = msg.mission_id
+            self.task_command = command
+            self.tool_type = self.selected_tool_type
+            self._task_result_sent = False
+            self._transition(State.TOOL_ACTION)
             return
         if command == 'STOP':
             self._cancel_arm_motion()
@@ -783,7 +800,7 @@ class ArmFsmNode(Node):
 
     def _tool_ready(self):
         if (self.selected_tool_type != 'cleaner'
-                and not self.tool_profile_valid):
+                and not self.tool_profile_valid and not self.validation_mode):
             return False
         if self.dry_run_mode:
             return True
@@ -791,7 +808,9 @@ class ArmFsmNode(Node):
             return False
         age = (self.get_clock().now() - self._tool_status_stamp).nanoseconds * 1e-9
         return (age <= self.tool_status_timeout
-                and bool(self._tool_status.get('profile_valid'))
+                and (bool(self._tool_status.get('profile_valid'))
+                     or (self.validation_mode
+                         and bool(self._tool_status.get('validation_mode'))))
                 and bool(self._tool_status.get('actuators_discovered'))
                 and bool(self._tool_status.get('motion_allowed')))
 
@@ -958,7 +977,9 @@ class ArmFsmNode(Node):
 
     def _do_tool_action(self):
         """Dispatch to a backend without exposing actuator APIs to the VLA layer."""
-        if self.task_command == 'MOVE':
+        if self.task_command == 'VALIDATE_OPEN':
+            self._do_validation_open()
+        elif self.task_command == 'MOVE':
             self._transition(State.RETRACT)
         elif (self.task_command == 'PICK'
               and self.selected_tool_type in (
@@ -971,6 +992,25 @@ class ArmFsmNode(Node):
             self._publish_task_result(
                 self.mission_id, False, 'TOOL_ACTION', 'unsupported tool backend')
             self._transition(State.STOWING)
+
+    def _do_validation_open(self):
+        """Validation-only OPEN with real position action and simulated effort."""
+        self._set_status(ARM_EXECUTING)
+        if not self._tool_ready():
+            self._fail_tool_action('validation gripper backend unavailable')
+            return
+        if self._gripper_command_state == 'idle':
+            self._send_gripper(float(self.tool_profile.get('open_position', 1.0)))
+            return
+        if self._gripper_command_state == 'active':
+            return
+        ok = self._gripper_command_ok
+        self._gripper_command_state = 'idle'
+        self._publish_task_result(
+            self.mission_id, bool(ok), 'TOOL_ACTION',
+            'validation OPEN: effort result simulated' if ok
+            else 'validation OPEN action failed')
+        self._transition(State.IDLE)
 
     def _do_grasp(self):
         """Shared GRASP sub-FSM entry for either calibrated gripper backend."""

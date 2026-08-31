@@ -3,14 +3,15 @@
 import shlex
 import time
 
-from PyQt5.QtCore import QProcess, QTimer, Qt
+from PyQt5.QtCore import QEvent, QProcess, QTimer, Qt
 from PyQt5.QtWidgets import (
-    QAbstractSpinBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
+    QApplication, QAbstractSpinBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout,
     QGroupBox, QHBoxLayout, QLabel, QMainWindow, QMessageBox, QPushButton,
     QLineEdit, QTableWidget, QTableWidgetItem, QTextEdit, QVBoxLayout, QWidget)
 
 from robot_manual_gui.ros_interface import ARM_JOINTS
 from dynamixel_control.tool_manager import ToolManager
+from dynamixel_control.single_motor_endpoints import jog_limits as single_jog_limits
 
 
 TRUE_STYLE = 'color: #0b7a25; font-weight: bold;'
@@ -37,6 +38,16 @@ class ManualMainWindow(QMainWindow):
         self.arm_widgets = {}
         self.gripper_busy = False
         self.gripper_target_ticks = {}
+        self.dual_single_motor_test_mode = bool(getattr(
+            self.node, 'dual_single_motor_test_mode', False))
+        self.dual_manual_test_mode = bool(getattr(
+            self.node, 'dual_manual_test_mode', False))
+        self.held_motor_direction = 0
+        self.held_motor_key = None
+        self.single_preset_target = None
+        self.motor_repeat = QTimer(self)
+        self.motor_repeat.setInterval(150)
+        self.motor_repeat.timeout.connect(self._repeat_single_motor_jog)
         self.temporary_jog_safe_min = getattr(
             self.node, 'temporary_jog_safe_min', 2867)
         self.temporary_jog_safe_max = getattr(
@@ -48,9 +59,14 @@ class ManualMainWindow(QMainWindow):
         self.temporary_jog_mechanical_close = (
             get_param('temporary_jog_mechanical_close_tick').value
             if get_param else 3857)
-        self.setWindowTitle('Extreme Robot Manual Hardware Validation')
+        self.setWindowTitle('익스트림 로봇 수동 하드웨어 검증')
         self.resize(1180, 850)
         self._build_ui()
+        # Filter the QApplication itself so Q/W reaches the jog controller
+        # regardless of which current or subsequently-created widget has focus.
+        self.application = QApplication.instance()
+        if self.application is not None:
+            self.application.installEventFilter(self)
         self._connect_signals()
         self.watchdog = QTimer(self)
         self.watchdog.timeout.connect(self._refresh_connection)
@@ -60,7 +76,12 @@ class ManualMainWindow(QMainWindow):
         root = QWidget()
         outer = QVBoxLayout(root)
 
-        self.scope_banner = QLabel(f'CONTROL / TEST SCOPE: {self.node.control_scope}')
+        scope_names = {
+            'END_EFFECTOR_ONLY': '엔드 이펙터만',
+            'FULL_ROBOT': '전체 로봇',
+        }
+        scope = scope_names.get(self.node.control_scope, self.node.control_scope)
+        self.scope_banner = QLabel(f'제어 / 시험 범위: {scope}')
         self.scope_banner.setAlignment(Qt.AlignCenter)
         self.scope_banner.setStyleSheet(
             'font-size: 22px; font-weight: bold; padding: 8px; '
@@ -68,15 +89,15 @@ class ManualMainWindow(QMainWindow):
         outer.addWidget(self.scope_banner)
 
         safety = QHBoxLayout()
-        self.estop = QPushButton('EMERGENCY STOP')
+        self.estop = QPushButton('긴급 정지')
         self.estop.setMinimumHeight(62)
         self.estop.setStyleSheet(ESTOP_STYLE)
         self.estop.clicked.connect(self._estop)
-        self.detach = QPushButton('TOOL DETACHED')
+        self.detach = QPushButton('도구 분리')
         self.detach.clicked.connect(self._detach)
-        self.reset = QPushButton('RESET E-STOP (restart required)')
+        self.reset = QPushButton('긴급 정지 해제 (재시작 필요)')
         self.reset.setEnabled(False)
-        self.estop_state = QLabel('E-STOP: FALSE')
+        self.estop_state = QLabel('긴급 정지: 해제')
         self.estop_state.setStyleSheet(TRUE_STYLE)
         safety.addWidget(self.estop, 3)
         safety.addWidget(self.detach)
@@ -97,7 +118,7 @@ class ManualMainWindow(QMainWindow):
 
         self.diag = QTableWidget(0, 5)
         self.diag.setHorizontalHeaderLabels(
-            ['ID', 'Joint', 'Position', 'Current/Load', 'Online'])
+            ['ID', '관절', '위치', '전류/부하', '연결'])
         outer.addWidget(self.diag)
         self.log = QTextEdit()
         self.log.setReadOnly(True)
@@ -106,29 +127,29 @@ class ManualMainWindow(QMainWindow):
         self.setCentralWidget(root)
 
     def _status_group(self):
-        box = QGroupBox('Connection / Status')
+        box = QGroupBox('연결 / 상태')
         form = QFormLayout(box)
         self.status_labels = {}
         for key, title in (
-                ('connection', 'Bridge connection'),
-                ('u2d2', 'U2D2 / serial'), ('tool_type', 'Tool type'),
-                ('profile_valid', 'Profile valid'),
-                ('actuators_discovered', 'Actuators discovered'),
-                ('motion_allowed', 'Motion allowed'), ('fsm', 'FSM state'),
-                ('arm_status', 'Arm contract state'), ('mode', 'Control mode'),
-                ('contact', 'Contact sensor')):
-            label = QLabel('UNKNOWN')
+                ('connection', '브리지 연결'),
+                ('u2d2', 'U2D2 / 직렬 통신'), ('tool_type', '도구 유형'),
+                ('profile_valid', '프로파일 유효'),
+                ('actuators_discovered', '구동기 감지'),
+                ('motion_allowed', '동작 허용'), ('fsm', 'FSM 상태'),
+                ('arm_status', '로봇팔 계약 상태'), ('mode', '제어 모드'),
+                ('contact', '접촉 센서')):
+            label = QLabel('확인 중')
             self.status_labels[key] = label
             form.addRow(title, label)
         return box
 
     def _arm_group(self):
-        box = QGroupBox('Arm Manual Control')
+        box = QGroupBox('로봇팔 수동 제어')
         layout = QGridLayout(box)
-        layout.addWidget(QLabel('Joint'), 0, 0)
-        layout.addWidget(QLabel('Current rad'), 0, 1)
-        layout.addWidget(QLabel('Jog'), 0, 2, 1, 2)
-        layout.addWidget(QLabel('Target rad'), 0, 4)
+        layout.addWidget(QLabel('관절'), 0, 0)
+        layout.addWidget(QLabel('현재값(rad)'), 0, 1)
+        layout.addWidget(QLabel('조그'), 0, 2, 1, 2)
+        layout.addWidget(QLabel('목표값(rad)'), 0, 4)
         self.arm_buttons = []
         self.arm_position_labels = {}
         self.arm_targets = {}
@@ -139,7 +160,7 @@ class ManualMainWindow(QMainWindow):
             target = QDoubleSpinBox()
             target.setRange(-6.283, 6.283)
             target.setDecimals(4)
-            send = QPushButton('GO')
+            send = QPushButton('이동')
             minus.clicked.connect(
                 lambda _checked=False, name=joint: self._jog(name, -1))
             plus.clicked.connect(
@@ -158,71 +179,96 @@ class ManualMainWindow(QMainWindow):
             self.arm_widgets[joint] = [minus, plus, target, send]
         self.jog_step = QComboBox()
         self.jog_step.addItems(['0.5', '1.0', '5.0'])
-        layout.addWidget(QLabel('Jog step (deg)'), 6, 0)
+        layout.addWidget(QLabel('조그 간격(도)'), 6, 0)
         layout.addWidget(self.jog_step, 6, 1)
         return box
 
     def _tool_selection_group(self):
-        box = QGroupBox('Tool Selection / Ownership')
+        box = QGroupBox('도구 선택 / 제어권')
         form = QFormLayout(box)
         self.tool_combo = QComboBox()
         self.tool_combo.addItems([
             'dual_motor_gripper', 'spur_1motor_gripper', 'cleaner'])
         self.tool_combo.setCurrentText(self.node.selected_tool)
-        request = QPushButton('REQUEST TOOL CHANGE')
+        request = QPushButton('도구 변경 요청')
         request.clicked.connect(self._request_tool_change)
         self.mode_combo = QComboBox()
         self.mode_combo.addItems(['FSM', 'MANUAL'])
-        mode_request = QPushButton('REQUEST MODE')
+        mode_request = QPushButton('모드 변경 요청')
         mode_request.clicked.connect(self._request_mode)
-        form.addRow('Selected tool', self.tool_combo)
+        form.addRow('선택한 도구', self.tool_combo)
         form.addRow('', request)
-        form.addRow('Ownership', self.mode_combo)
+        form.addRow('제어권', self.mode_combo)
         form.addRow('', mode_request)
         return box
 
     def _tool_control_group(self):
-        box = QGroupBox('End Effector')
+        box = QGroupBox('엔드 이펙터')
         layout = QVBoxLayout(box)
         self.profile_text = QLabel(self._profile_summary())
         self.profile_text.setWordWrap(True)
         layout.addWidget(self.profile_text)
         row = QHBoxLayout()
-        self.open_button = QPushButton('OPEN')
-        self.close_button = QPushButton('CLOSE')
-        self.tool_stop = QPushButton('STOP')
-        self.open_button.clicked.connect(lambda: self.node.command_gripper(
-            float(self.profile.get('open_position', 1.0))))
-        self.close_button.clicked.connect(lambda: self.node.command_gripper(
-            float(self.profile.get('close_position', 0.0))))
+        self.open_button = QPushButton('열기')
+        self.close_button = QPushButton('닫기')
+        self.tool_stop = QPushButton('정지')
+        if self.dual_single_motor_test_mode:
+            self.open_button.clicked.connect(
+                lambda: self._start_single_motor_preset('open'))
+            self.close_button.clicked.connect(
+                lambda: self._start_single_motor_preset('close'))
+        else:
+            self.open_button.clicked.connect(lambda: self.node.command_gripper(
+                float(self.profile.get('open_position', 1.0))))
+            self.close_button.clicked.connect(lambda: self.node.command_gripper(
+                float(self.profile.get('close_position', 0.0))))
         self.tool_stop.clicked.connect(self.node.stop_gripper)
         row.addWidget(self.open_button)
         row.addWidget(self.close_button)
         row.addWidget(self.tool_stop)
         layout.addLayout(row)
-        jog = QGroupBox('GRIPPER JOG')
+        jog = QGroupBox('그리퍼 조그')
         jog_layout = QGridLayout(jog)
         if self.node.selected_tool == 'spur_1motor_gripper':
-            left_label, right_label = 'LEFT / −  (OPEN)', 'RIGHT / +  (CLOSE)'
+            left_label, right_label = '← / −  (열기)', '→ / +  (닫기)'
+        elif self.dual_manual_test_mode:
+            left_label, right_label = 'Q  열림 (두 모터)', 'W  닫힘 (두 모터)'
         else:
-            left_label, right_label = 'LEFT / −  (CLOSE)', 'RIGHT / +  (OPEN)'
+            left_label, right_label = '← / −  (닫기)', '→ / +  (열기)'
         self.jog_close = QPushButton(left_label)
         self.jog_open = QPushButton(right_label)
         self.gripper_jog_step = QComboBox()
         self.gripper_jog_step.addItems(['5', '10', '25', '50'])
-        self.gripper_busy_label = QLabel('READY')
-        self.gripper_position_label = QLabel('Gripper position: UNKNOWN')
-        self.gripper_feedback_label = QLabel('ID3: UNKNOWN\nID4: UNKNOWN')
+        self.gripper_busy_label = QLabel('준비')
+        self.gripper_position_label = QLabel('그리퍼 위치: 확인 중')
+        self.gripper_feedback_label = QLabel('ID3: 확인 중\nID4: 확인 중')
         self.gripper_feedback_label.setWordWrap(True)
         shortcut = QLabel(
-            'Shortcuts: Left=CLOSE jog, Right=OPEN jog, Space=STOP\n'
-            '(disabled while editing a field; key auto-repeat ignored)')
+            (('키보드: Q=열림, W=닫힘 (두 모터 normalized 동기화)\n'
+              if self.dual_manual_test_mode else
+              '키보드: Q=ID3 tick 5 감소, W=ID3 tick 5 증가\n')
+             + '(누르는 동안 150ms 간격 반복, 키를 떼면 즉시 정지)'))
         shortcut.setWordWrap(True)
-        self.jog_close.clicked.connect(lambda: self._jog_gripper(-1))
-        self.jog_open.clicked.connect(lambda: self._jog_gripper(1))
+        if self.dual_single_motor_test_mode or self.dual_manual_test_mode:
+            # Mouse holds use exactly the same press/repeat/release path as Q/W.
+            close_direction = 1 if self.dual_manual_test_mode else -1
+            open_direction = -1 if self.dual_manual_test_mode else 1
+            close_key = 'Q' if self.dual_manual_test_mode else 'Q'
+            open_key = 'W' if self.dual_manual_test_mode else 'W'
+            self.jog_close.pressed.connect(
+                lambda: self._start_motor_jog(close_direction, close_key))
+            self.jog_close.released.connect(
+                lambda: self._release_motor_jog(close_direction, close_key))
+            self.jog_open.pressed.connect(
+                lambda: self._start_motor_jog(open_direction, open_key))
+            self.jog_open.released.connect(
+                lambda: self._release_motor_jog(open_direction, open_key))
+        else:
+            self.jog_close.clicked.connect(lambda: self._jog_gripper(-1))
+            self.jog_open.clicked.connect(lambda: self._jog_gripper(1))
         jog_layout.addWidget(self.jog_close, 0, 0)
         jog_layout.addWidget(self.jog_open, 0, 1)
-        jog_layout.addWidget(QLabel('Step (tick equivalent)'), 1, 0)
+        jog_layout.addWidget(QLabel('간격(틱 기준)'), 1, 0)
         jog_layout.addWidget(self.gripper_jog_step, 1, 1)
         jog_layout.addWidget(self.gripper_busy_label, 2, 0, 1, 2)
         jog_layout.addWidget(self.gripper_position_label, 3, 0, 1, 2)
@@ -230,25 +276,40 @@ class ManualMainWindow(QMainWindow):
         shortcut_row = 5
         if self.node.selected_tool == 'spur_1motor_gripper':
             jog_layout.addWidget(QLabel(
-                f'Safe range: {self.temporary_jog_safe_min} ~ '
+                f'안전 범위: {self.temporary_jog_safe_min} ~ '
                 f'{self.temporary_jog_safe_max}\n'
-                f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
+                f'기계적 범위: {self.temporary_jog_mechanical_open} ~ '
                 f'{self.temporary_jog_mechanical_close}\n'
-                'Direction: OPEN ← [−]   [+] → CLOSE'), 5, 0, 1, 2)
+                '방향: 열기 ← [−]   [+] → 닫기'), 5, 0, 1, 2)
             shortcut_row = 6
         jog_layout.addWidget(shortcut, shortcut_row, 0, 1, 2)
+        self.endpoint_label = QLabel()
+        self.save_open_endpoint = QPushButton('현재 ID3 위치를 열림 최대로 저장')
+        self.save_close_endpoint = QPushButton('현재 ID3 위치를 닫힘 최대로 저장')
+        self.save_open_endpoint.clicked.connect(
+            lambda: self._save_single_endpoint('open'))
+        self.save_close_endpoint.clicked.connect(
+            lambda: self._save_single_endpoint('close'))
+        endpoint_row = shortcut_row + 1
+        jog_layout.addWidget(self.endpoint_label, endpoint_row, 0, 1, 2)
+        jog_layout.addWidget(self.save_open_endpoint, endpoint_row + 1, 0, 1, 2)
+        jog_layout.addWidget(self.save_close_endpoint, endpoint_row + 2, 0, 1, 2)
+        for widget in (self.endpoint_label, self.save_open_endpoint,
+                       self.save_close_endpoint):
+            widget.setVisible(self.dual_single_motor_test_mode)
+        self._refresh_endpoint_label()
         layout.addWidget(jog)
         cleaner = QHBoxLayout()
-        self.clean_start = QPushButton('CLEANER START')
-        self.clean_stop = QPushButton('CLEANER STOP')
+        self.clean_start = QPushButton('클리너 시작')
+        self.clean_stop = QPushButton('클리너 정지')
         self.clean_start.clicked.connect(lambda: self.node.command_cleaner(True))
         self.clean_stop.clicked.connect(lambda: self.node.command_cleaner(False))
         cleaner.addWidget(self.clean_start)
         cleaner.addWidget(self.clean_stop)
         layout.addLayout(cleaner)
         calibration = QHBoxLayout()
-        self.read_diag = QPushButton('READ ONLY DIAGNOSTIC')
-        self.start_cal = QPushButton('START CALIBRATION')
+        self.read_diag = QPushButton('읽기 전용 진단')
+        self.start_cal = QPushButton('캘리브레이션 시작')
         self.read_diag.clicked.connect(self._read_only_diagnostic)
         self.start_cal.clicked.connect(self._start_calibration)
         calibration.addWidget(self.read_diag)
@@ -257,10 +318,18 @@ class ManualMainWindow(QMainWindow):
         return box
 
     def _profile_summary(self):
-        keys = ('calibrated', 'actuator_ids', 'safe_min_tick', 'safe_max_tick',
-                'open_tick', 'close_tick', 'profile_velocity',
-                'profile_acceleration')
-        return '\n'.join(f'{key}: {self.profile.get(key)}' for key in keys)
+        fields = (
+            ('calibrated', '캘리브레이션 완료'),
+            ('actuator_ids', '구동기 ID'),
+            ('safe_min_tick', '안전 최소 틱'),
+            ('safe_max_tick', '안전 최대 틱'),
+            ('open_tick', '열림 틱'),
+            ('close_tick', '닫힘 틱'),
+            ('profile_velocity', '프로파일 속도'),
+            ('profile_acceleration', '프로파일 가속도'),
+        )
+        return '\n'.join(
+            f'{label}: {self.profile.get(key)}' for key, label in fields)
 
     def _connect_signals(self):
         self.signals.joint_states.connect(self._update_joints)
@@ -275,7 +344,7 @@ class ManualMainWindow(QMainWindow):
         self.signals.gripper_state.connect(self._update_gripper_state)
 
     def _set_bool(self, label, value):
-        label.setText('TRUE' if value else 'FALSE')
+        label.setText('정상' if value else '아님')
         label.setStyleSheet(TRUE_STYLE if value else FALSE_STYLE)
 
     def _refresh_connection(self):
@@ -288,13 +357,14 @@ class ManualMainWindow(QMainWindow):
     def _update_tool_status(self, status):
         self.tool_status = status
         self.last_status_time = time.monotonic()
-        self.status_labels['tool_type'].setText(status.get('tool_type', 'UNKNOWN'))
+        self.status_labels['tool_type'].setText(status.get('tool_type', '확인 중'))
         self._set_bool(
             self.status_labels['u2d2'], bool(status.get('u2d2_connected')))
         for key in ('profile_valid', 'actuators_discovered', 'motion_allowed'):
             self._set_bool(self.status_labels[key], bool(status.get(key)))
         estop = bool(status.get('emergency_stop'))
-        self.estop_state.setText(f'E-STOP: {str(estop).upper()}')
+        self.estop_state.setText(
+            f'긴급 정지: {"작동" if estop else "해제"}')
         self.estop_state.setStyleSheet(FALSE_STYLE if estop else TRUE_STYLE)
         self._refresh_buttons()
         self._rebuild_diagnostics(status.get('actuators', []))
@@ -315,6 +385,8 @@ class ManualMainWindow(QMainWindow):
 
     def _update_mode(self, mode):
         self.control_mode = mode
+        if mode != 'MANUAL':
+            self._stop_motor_repeat()
         self.status_labels['mode'].setText(mode)
         self._refresh_buttons()
 
@@ -335,8 +407,13 @@ class ManualMainWindow(QMainWindow):
         calibrated = bool(self.profile.get('calibrated')) or self.mock_mode
         preset_ready = (manual and gripper and profile_ok and motion
                         and calibrated and not self.gripper_busy)
-        self.open_button.setEnabled(preset_ready)
-        self.close_button.setEnabled(preset_ready)
+        endpoints = getattr(self.node, 'single_motor_endpoints', {})
+        self.open_button.setEnabled(
+            preset_ready and (not self.dual_single_motor_test_mode
+                              or endpoints.get('open_tick') is not None))
+        self.close_button.setEnabled(
+            preset_ready and (not self.dual_single_motor_test_mode
+                              or endpoints.get('close_tick') is not None))
         self.tool_stop.setEnabled(
             manual and gripper and profile_ok
             and (self.gripper_busy or motion))
@@ -345,7 +422,8 @@ class ManualMainWindow(QMainWindow):
                      and self.node.selected_tool in (
                          'dual_motor_gripper', 'spur_1motor_gripper')
                      and self._tool_motion_ready()
-                     and self._gripper_positions_synchronized())
+                     and (self.dual_single_motor_test_mode
+                          or self._gripper_positions_synchronized()))
         # When the measured position is outside the temporary range, expose
         # only the inward recovery direction.  This prevents a disabled
         # direction from being retried by either a click or a key shortcut.
@@ -362,6 +440,10 @@ class ManualMainWindow(QMainWindow):
         self.jog_close.setEnabled(jog_ready and spur_open_allowed)
         self.jog_open.setEnabled(jog_ready and spur_close_allowed)
         self.gripper_jog_step.setEnabled(not self.gripper_busy)
+        endpoint_save_ready = self.dual_single_motor_test_mode \
+            and self._single_motor_test_ready()
+        self.save_open_endpoint.setEnabled(endpoint_save_ready)
+        self.save_close_endpoint.setEnabled(endpoint_save_ready)
         cleaner = self.node.selected_tool == 'cleaner'
         configured = bool(self.tool_status.get('actuators_discovered'))
         self.clean_start.setEnabled(manual and cleaner and profile_ok
@@ -383,17 +465,22 @@ class ManualMainWindow(QMainWindow):
             and bool(self.tool_status.get('calibrated'))
         temporary_ready = bool(self.tool_status.get('temporary_jog_ready')) \
             and self.node.temporary_jog_mode
+        single_motor_torque_ok = (
+            not self.dual_single_motor_test_mode
+            or (self.tool_status.get('dual_single_motor_test_mode')
+                and set(self.tool_status.get('torque_enabled_ids', [])) == {3}))
         return (fresh and bool(self.tool_status.get('bridge_connected'))
                 and bool(self.tool_status.get('motion_allowed')) and scope_ok
                 and actuators_ok and (profile_ready or temporary_ready)
                 and not bool(self.tool_status.get('read_only'))
                 and not bool(self.tool_status.get('emergency_stop'))
-                and not bool(self.tool_status.get('tool_detached')))
+                and not bool(self.tool_status.get('tool_detached'))
+                and single_motor_torque_ok)
 
     def _update_gripper_state(self, busy, state):
         self.gripper_busy = bool(busy)
         self.gripper_busy_label.setText(
-            f'BUSY: {state}' if busy else f'READY: {state}')
+            f'동작 중: {state}' if busy else f'준비: {state}')
         self.gripper_busy_label.setStyleSheet(
             FALSE_STYLE if busy else TRUE_STYLE)
         self._refresh_buttons()
@@ -423,6 +510,11 @@ class ManualMainWindow(QMainWindow):
         return fractions
 
     def _gripper_positions_synchronized(self):
+        # ID4 is deliberately torque-free in this diagnostic mode.  Its
+        # position is expected to diverge and must never gate ID3 jogging.
+        if self.dual_single_motor_test_mode or self.dual_manual_test_mode:
+            sample = self._gripper_samples().get(3, {})
+            return sample.get('position') is not None and bool(sample.get('online'))
         if self.node.selected_tool == 'spur_1motor_gripper':
             sample = self._gripper_samples().get(5, {})
             return sample.get('position') is not None and bool(sample.get('online'))
@@ -432,21 +524,38 @@ class ManualMainWindow(QMainWindow):
 
     def _update_gripper_feedback(self):
         samples = self._gripper_samples()
+        if self.dual_single_motor_test_mode:
+            id3 = samples.get(3, {})
+            id4 = samples.get(4, {})
+            current = id3.get('position')
+            target = self.gripper_target_ticks.get(3)
+            error = None if current is None or target is None else target - current
+            self.gripper_position_label.setText(
+                f'ID3 단독 제어 | 현재: {current} | 목표: {target} '
+                f'| 오차: {error}')
+            self.gripper_feedback_label.setText(
+                f'ID3: Torque ON, 현재={current}, 목표={target}, '
+                f'전류/부하={id3.get("effort")}, '
+                f'연결={id3.get("online", False)}\n'
+                f'ID4: Torque OFF / 수동 회전, 현재={id4.get("position")}, '
+                f'연결={id4.get("online", False)}\n'
+                '단일모터 시험: ID3/ID4 정규화 편차 검사 미적용')
+            return
         if self.node.selected_tool == 'spur_1motor_gripper':
             sample = samples.get(5, {})
             current = sample.get('position')
             target = self.gripper_target_ticks.get(5)
             error = None if current is None or target is None else target - current
             self.gripper_position_label.setText(
-                f'Spur Gripper | Current: {current} | Target: {target} '
-                f'| Error: {error}')
+                f'스퍼 그리퍼 | 현재: {current} | 목표: {target} '
+                f'| 오차: {error}')
             self.gripper_feedback_label.setText(
-                f'ID5: current={current}, target={target}, error={error}, '
-                f'current/load={sample.get("effort")}, '
-                f'online={sample.get("online", False)}\n'
-                f'Safe range: {self.temporary_jog_safe_min} ~ '
+                f'ID5: 현재={current}, 목표={target}, 오차={error}, '
+                f'전류/부하={sample.get("effort")}, '
+                f'연결={sample.get("online", False)}\n'
+                f'안전 범위: {self.temporary_jog_safe_min} ~ '
                 f'{self.temporary_jog_safe_max}\n'
-                f'Mechanical range: {self.temporary_jog_mechanical_open} ~ '
+                f'기계적 범위: {self.temporary_jog_mechanical_open} ~ '
                 f'{self.temporary_jog_mechanical_close}')
             return
         fractions = self._normalized_positions()
@@ -454,27 +563,36 @@ class ManualMainWindow(QMainWindow):
             normalized = sum(fractions.values()) / len(fractions)
             spread = max(fractions.values()) - min(fractions.values())
             self.gripper_position_label.setText(
-                f'Gripper position: {normalized:.4f} '
-                f'(0.0=closed, 1.0=open, motor spread={spread:.4f})')
+                f'그리퍼 위치: {normalized:.4f} '
+                f'(0.0=닫힘, 1.0=열림, 모터 편차={spread:.4f})')
             if not self.gripper_busy and spread > 0.05:
                 self.gripper_busy_label.setText(
-                    f'BLOCKED: motor normalized spread {spread:.4f} > 0.0500')
+                    f'차단: 모터 정규화 편차 {spread:.4f} > 0.0500')
                 self.gripper_busy_label.setStyleSheet(FALSE_STYLE)
         else:
-            self.gripper_position_label.setText('Gripper position: UNKNOWN')
+            self.gripper_position_label.setText('그리퍼 위치: 확인 중')
         lines = []
         for dxl_id in self.profile.get('actuator_ids', []):
             sample = samples.get(dxl_id, {})
             current = sample.get('position')
             target = self.gripper_target_ticks.get(dxl_id)
             error = None if current is None or target is None else target - current
+            normalized = fractions.get(dxl_id)
             lines.append(
-                f'ID{dxl_id}: current={current}, target={target}, '
-                f'error={error}, current/load={sample.get("effort")}, '
-                f'online={sample.get("online", False)}')
-        self.gripper_feedback_label.setText('\n'.join(lines) or 'No actuator data')
+                f'ID{dxl_id}: Present={current}, Goal={target}, 오차={error}, '
+                f'normalized={normalized}, Velocity={sample.get("velocity")}, '
+                f'Current/Load={sample.get("effort")}, '
+                f'Torque={sample.get("torque", sample.get("torque_state"))}, '
+                f'Mode={sample.get("operating_mode")}, '
+                f'HardwareError={sample.get("hardware_error")}, '
+                f'연결={sample.get("online", False)}')
+        self.gripper_feedback_label.setText(
+            '\n'.join(lines) or '구동기 데이터 없음')
 
     def _jog_gripper(self, direction):
+        if self.dual_single_motor_test_mode:
+            self._jog_single_id3(direction)
+            return
         reason = self._gripper_jog_block_reason()
         if reason:
             self._append_log(f'Gripper jog blocked: {reason}')
@@ -523,6 +641,143 @@ class ManualMainWindow(QMainWindow):
             self.gripper_target_ticks = targets
             self._update_gripper_feedback()
 
+    def _jog_single_id3(self, direction, final_target=None):
+        if not self._single_motor_test_ready():
+            self._append_log(
+                'ID3 조그 차단: ID3 ON / ID4 OFF 상태가 준비되지 않음')
+            self._stop_motor_repeat()
+            return
+        sample = self._gripper_samples().get(3, {})
+        current = sample.get('position')
+        if current is None:
+            self._stop_motor_repeat()
+            return
+        saved = getattr(self.node, 'single_motor_endpoints', {})
+        low, high, _calibrated = single_jog_limits(saved)
+        # Always step from fresh measured feedback.  Building on the previous
+        # requested target can outrun a slow motor during a long key hold.
+        base = int(current)
+        step = int(self.gripper_jog_step.currentText())
+        distance = step if final_target is None else min(
+            step, abs(int(final_target) - base))
+        target = base + direction * distance
+        if ((base < low and direction < 0)
+                or (base > high and direction > 0)
+                or (low <= base <= high and not low <= target <= high)):
+            self._append_log(
+                f'ID3 조그 차단: target={target}, 안전 범위=[{low}, {high}]')
+            self._stop_motor_repeat()
+            return
+        if target == base:
+            self._stop_motor_repeat()
+            return
+        if self.node.command_single_motor_tick(target):
+            self.gripper_target_ticks[3] = target
+            self._update_gripper_feedback()
+
+    def _single_motor_test_ready(self):
+        return bool(
+            self.dual_single_motor_test_mode
+            and self.control_mode == 'MANUAL'
+            and self._tool_motion_ready()
+            and self.tool_status.get('dual_single_motor_test_mode')
+            and set(self.tool_status.get('torque_enabled_ids', [])) == {3}
+            and self._gripper_samples().get(3, {}).get('online')
+            and self._gripper_samples().get(4, {}).get('online'))
+
+    def _repeat_single_motor_jog(self):
+        if self.dual_manual_test_mode:
+            if self.held_motor_direction:
+                self._jog_gripper(self.held_motor_direction)
+            return
+        if self.single_preset_target is not None:
+            current = self._gripper_samples().get(3, {}).get('position')
+            if current is None or int(current) == self.single_preset_target:
+                self._stop_motor_repeat()
+                return
+            direction = 1 if self.single_preset_target > current else -1
+            self._jog_single_id3(direction, self.single_preset_target)
+            return
+        if self.held_motor_direction:
+            self._trace_jog(f'{self.held_motor_key} repeat')
+            self._jog_single_id3(self.held_motor_direction)
+
+    def _stop_motor_repeat(self):
+        self.held_motor_direction = 0
+        self.held_motor_key = None
+        self.single_preset_target = None
+        self.motor_repeat.stop()
+
+    def _trace_jog(self, message):
+        """Emit requested key traces to the launch terminal (and test stdout)."""
+        get_logger = getattr(self.node, 'get_logger', None)
+        if get_logger is not None:
+            get_logger().info(message)
+        else:
+            print(message, flush=True)
+
+    def _start_motor_jog(self, direction, key_name):
+        """Perform one immediate jog and start our own stable repeat timer."""
+        if not (self.dual_single_motor_test_mode or self.dual_manual_test_mode):
+            self._jog_gripper(direction)
+            return
+        if (self.held_motor_direction == direction
+                and self.motor_repeat.isActive()):
+            return
+        self._stop_motor_repeat()
+        self.held_motor_direction = direction
+        self.held_motor_key = key_name
+        self._trace_jog(f'{key_name} pressed')
+        self._jog_single_id3(direction)
+        # A blocked immediate movement stops the timer through the safety path.
+        if self.held_motor_direction == direction:
+            self.motor_repeat.start(150)
+
+    def _release_motor_jog(self, direction, key_name):
+        """Stop only the direction associated with the physical release."""
+        if self.held_motor_direction != direction:
+            return
+        self._trace_jog(f'{key_name} released')
+        self._stop_motor_repeat()
+
+    def _start_single_motor_preset(self, kind):
+        target = getattr(self.node, 'single_motor_endpoints', {}).get(
+            f'{kind}_tick')
+        if target is None or not self._single_motor_test_ready():
+            self._append_log(f'{kind} 최대 위치/안전 상태 미준비')
+            return
+        self._stop_motor_repeat()
+        self.single_preset_target = int(target)
+        self.motor_repeat.start()
+        self._repeat_single_motor_jog()
+
+    def _refresh_endpoint_label(self):
+        endpoints = getattr(self.node, 'single_motor_endpoints', {})
+        opened = endpoints.get('open_tick')
+        closed = endpoints.get('close_tick')
+        safe = ('미설정' if opened is None or closed is None else
+                f'{min(opened, closed)} ~ {max(opened, closed)}')
+        self.endpoint_label.setText(
+            f'열림 최대: {opened} | 닫힘 최대: {closed}\n'
+            f'저장된 안전범위: {safe}')
+
+    def _save_single_endpoint(self, kind):
+        sample = self._gripper_samples().get(3, {})
+        current = sample.get('position')
+        if current is None or not self._single_motor_test_ready():
+            self._append_log('ID3 위치를 저장할 수 없음: 피드백/안전 상태 미준비')
+            return
+        try:
+            endpoints = self.node.save_single_motor_endpoint(kind, int(current))
+        except (OSError, ValueError) as exc:
+            self._append_log(f'ID3 최대 위치 저장 실패: {exc}')
+            return
+        self.gripper_target_ticks.clear()
+        self._refresh_endpoint_label()
+        self._append_log(
+            f'ID3 {kind} 최대 저장: {current}, endpoints={endpoints}')
+        self._refresh_buttons()
+
     def _gripper_jog_block_reason(self):
         if self.node.control_scope != 'END_EFFECTOR_ONLY':
             return 'control scope is not END_EFFECTOR_ONLY'
@@ -535,6 +790,9 @@ class ManualMainWindow(QMainWindow):
             return 'BUSY'
         if not self._tool_motion_ready():
             return 'bridge/tool safety status is not ready or fresh'
+        if self.dual_single_motor_test_mode:
+            return '' if self._single_motor_test_ready() \
+                else 'ID3 torque / ID4 free-wheel state is not ready'
         if self.node.selected_tool == 'spur_1motor_gripper':
             sample = self._gripper_samples().get(5, {})
             if sample.get('position') is None or not sample.get('online'):
@@ -565,28 +823,95 @@ class ManualMainWindow(QMainWindow):
             self.gripper_target_ticks = {5: target}
             self._update_gripper_feedback()
 
-    def keyPressEvent(self, event):
+    def _handle_motor_key(self, event):
+        """Handle one safety-gated gripper shortcut; return True if consumed."""
+        minus_key = Qt.Key_Q if self.dual_single_motor_test_mode else Qt.Key_Left
+        plus_key = Qt.Key_W if self.dual_single_motor_test_mode else Qt.Key_Right
         if event.isAutoRepeat():
-            event.ignore()
-            return
+            # OS/Qt repeat presses and synthetic repeat releases must never
+            # restart or interrupt the single application-owned timer.
+            event.accept()
+            return event.key() in (minus_key, plus_key, Qt.Key_Space)
         focus = self.focusWidget()
         editing = isinstance(
             focus, (QAbstractSpinBox, QLineEdit, QTextEdit, QComboBox))
         enabled = (self.node.control_scope == 'END_EFFECTOR_ONLY'
                    and self.control_mode == 'MANUAL')
         if enabled and event.key() == Qt.Key_Space:
+            self._stop_motor_repeat()
             self.node.stop_gripper()
             event.accept()
-            return
-        if enabled and not editing and event.key() == Qt.Key_Left:
-            self._jog_gripper(-1)
+            return True
+        allow_jog = (self.dual_single_motor_test_mode
+                     or self.dual_manual_test_mode or not editing)
+        if self.dual_manual_test_mode:
+            if enabled and allow_jog and event.key() == Qt.Key_Q:
+                self._start_motor_jog(1, 'Q')
+                event.accept()
+                return True
+            if enabled and allow_jog and event.key() == Qt.Key_W:
+                self._start_motor_jog(-1, 'W')
+                event.accept()
+                return True
+            return False
+        if enabled and allow_jog and event.key() == minus_key:
+            self._start_motor_jog(-1, 'Q' if self.dual_single_motor_test_mode else 'LEFT')
+            event.accept()
+            return True
+        if enabled and allow_jog and event.key() == plus_key:
+            self._start_motor_jog(1, 'W' if self.dual_single_motor_test_mode else 'RIGHT')
+            event.accept()
+            return True
+        return False
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.KeyPress and self._handle_motor_key(event):
+            return True
+        if (event.type() == QEvent.KeyRelease
+                and event.key() in self._motor_jog_keys()
+                and (self.dual_single_motor_test_mode
+                     or self.dual_manual_test_mode)):
+            if event.isAutoRepeat():
+                event.accept()
+                return True
+            direction = ((1 if event.key() == Qt.Key_Q else -1)
+                         if self.dual_manual_test_mode else
+                         (-1 if event.key() == Qt.Key_Q else 1))
+            self._release_motor_jog(
+                direction, 'Q' if direction < 0 else 'W')
+            event.accept()
+            return True
+        return super().eventFilter(watched, event)
+
+    def keyReleaseEvent(self, event):
+        if (event.key() in self._motor_jog_keys()
+                and not event.isAutoRepeat()
+                and (self.dual_single_motor_test_mode
+                     or self.dual_manual_test_mode)):
+            direction = ((1 if event.key() == Qt.Key_Q else -1)
+                         if self.dual_manual_test_mode else
+                         (-1 if event.key() == Qt.Key_Q else 1))
+            self._release_motor_jog(
+                direction, 'Q' if direction < 0 else 'W')
             event.accept()
             return
-        if enabled and not editing and event.key() == Qt.Key_Right:
-            self._jog_gripper(1)
-            event.accept()
+        super().keyReleaseEvent(event)
+
+    def _motor_jog_keys(self):
+        if self.dual_single_motor_test_mode or self.dual_manual_test_mode:
+            return (Qt.Key_Q, Qt.Key_W)
+        return (Qt.Key_Left, Qt.Key_Right)
+
+    def keyPressEvent(self, event):
+        if self._handle_motor_key(event):
             return
         super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        self._stop_motor_repeat()
+        if self.application is not None:
+            self.application.removeEventFilter(self)
+        super().closeEvent(event)
 
     def _jog(self, joint, sign):
         self.node.jog_arm(joint, sign * float(self.jog_step.currentText()))
@@ -602,8 +927,9 @@ class ManualMainWindow(QMainWindow):
         if (requested == 'MANUAL'
                 and self.fsm_state not in ToolManager.SAFE_CHANGE_STATES):
             QMessageBox.warning(
-                self, 'Ownership denied',
-                f'MANUAL is allowed only in IDLE/STOWED; current={self.fsm_state}')
+                self, '제어권 요청 거부',
+                '수동 모드는 IDLE/STOWED 상태에서만 허용됩니다. '
+                f'현재 상태: {self.fsm_state}')
             return
         self.node.request_mode(requested)
 
@@ -615,24 +941,27 @@ class ManualMainWindow(QMainWindow):
             return
         if self.fsm_state not in ToolManager.SAFE_CHANGE_STATES:
             QMessageBox.warning(
-                self, 'Tool change denied',
-                f'ToolManager policy denies changes in {self.fsm_state}')
+                self, '도구 변경 거부',
+                f'ToolManager 정책상 {self.fsm_state} 상태에서는 '
+                '변경할 수 없습니다.')
             self.tool_combo.setCurrentText(current)
             return
         QMessageBox.information(
-            self, 'Restart required',
-            'Runtime hardware reprovisioning is not implemented. Stop the launch, '
-            f'detach safely, then restart with tool_type:={requested}.')
+            self, '재시작 필요',
+            '실행 중 하드웨어 재설정은 지원하지 않습니다. '
+            '런치를 종료하고 도구를 안전하게 분리한 뒤 '
+            f'tool_type:={requested}로 재시작하세요.')
         self.tool_combo.setCurrentText(current)
 
     def _estop(self):
         self.node.emergency_stop()
-        self.estop_state.setText('E-STOP: REQUESTED')
+        self.estop_state.setText('긴급 정지: 요청됨')
         self.estop_state.setStyleSheet(FALSE_STYLE)
 
     def _detach(self):
         answer = QMessageBox.question(
-            self, 'Confirm detach', 'Mark the current tool as DETACHED and stop it?')
+            self, '도구 분리 확인',
+            '현재 도구를 분리 상태로 표시하고 정지할까요?')
         if answer == QMessageBox.Yes:
             self.node.tool_detached()
 
@@ -646,7 +975,7 @@ class ManualMainWindow(QMainWindow):
         process.readyReadStandardError.connect(
             lambda: self._append_log(bytes(
                 process.readAllStandardError()).decode(errors='replace')))
-        process.finished.connect(lambda: self._append_log('Diagnostic process finished'))
+        process.finished.connect(lambda: self._append_log('진단 프로세스 종료'))
         self.processes.append(process)
         process.start()
 
@@ -663,18 +992,20 @@ class ManualMainWindow(QMainWindow):
 
     def _start_calibration(self):
         answer = QMessageBox.warning(
-            self, 'Powered calibration confirmation',
-            'Calibration can move the gripper. Stop the bridge first, clear the '
-            'mechanism, prepare emergency power-off, and continue in a terminal. '
-            'Launch the guarded calibration terminal now?',
+            self, '전원 캘리브레이션 확인',
+            '캘리브레이션 중 그리퍼가 움직일 수 있습니다. '
+            '먼저 브리지를 정지하고, 기구 주변을 비우고, '
+            '비상 전원 차단을 준비하세요. '
+            '보호된 캘리브레이션 터미널을 실행할까요?',
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
         if time.monotonic() - self.last_status_time < 1.5:
             QMessageBox.critical(
-                self, 'Serial bus still owned',
-                'The bridge is still running. Stop the bridge/stack first; calibration '
-                'will not be launched while another serial owner is active.')
+                self, '직렬 버스 사용 중',
+                '브리지가 아직 실행 중입니다. 먼저 브리지/스택을 '
+                '종료하세요. 다른 프로세스가 직렬 버스를 사용하는 '
+                '동안은 캘리브레이션을 실행하지 않습니다.')
             return
         actuator_id = self.profile.get('actuator_ids', [5])[0]
         command = (

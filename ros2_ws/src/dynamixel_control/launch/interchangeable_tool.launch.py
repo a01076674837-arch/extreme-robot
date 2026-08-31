@@ -17,6 +17,9 @@ def generate_launch_description():
     control_scope = LaunchConfiguration('control_scope')
     gripper_tolerance = LaunchConfiguration('gripper_target_tolerance_ticks')
     temporary_jog_mode = LaunchConfiguration('temporary_jog_mode')
+    dual_single_motor_test = LaunchConfiguration('dual_single_motor_test_mode')
+    dual_manual_test = LaunchConfiguration('dual_manual_test_mode')
+    validation_mode = LaunchConfiguration('validation_mode')
     temporary_safe_min = LaunchConfiguration('temporary_jog_safe_min_tick')
     temporary_safe_max = LaunchConfiguration('temporary_jog_safe_max_tick')
     mechanical_open = LaunchConfiguration('temporary_jog_mechanical_open_tick')
@@ -42,6 +45,11 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),
+        DeclareLaunchArgument('dual_single_motor_test_mode', default_value='false'),
+        DeclareLaunchArgument('dual_manual_test_mode', default_value='false'),
+        DeclareLaunchArgument(
+            'validation_mode', default_value='false',
+            description='Explicit endpoint/mode/HW validation; effort is simulated.'),
         DeclareLaunchArgument('temporary_jog_safe_min_tick', default_value='2867'),
         DeclareLaunchArgument('temporary_jog_safe_max_tick', default_value='3807'),
         DeclareLaunchArgument(
@@ -63,6 +71,12 @@ def generate_launch_description():
                     gripper_tolerance, value_type=int),
                 'temporary_jog_mode': ParameterValue(
                     temporary_jog_mode, value_type=bool),
+                'dual_single_motor_test_mode': ParameterValue(
+                    dual_single_motor_test, value_type=bool),
+                'dual_manual_test_mode': ParameterValue(
+                    dual_manual_test, value_type=bool),
+                'validation_mode': ParameterValue(
+                    validation_mode, value_type=bool),
                 'temporary_jog_safe_min_tick': ParameterValue(
                     temporary_safe_min, value_type=int),
                 'temporary_jog_safe_max_tick': ParameterValue(
@@ -83,6 +97,8 @@ def generate_launch_description():
             package='dynamixel_control', executable='arm_fsm', output='screen',
             parameters=[common, {
                 'dry_run_mode': ParameterValue(mock_mode, value_type=bool),
+                'validation_mode': ParameterValue(
+                    validation_mode, value_type=bool),
                 'sensor_mock_mode': ParameterValue(mock_mode, value_type=bool),
                 'vla_standalone_mode': ParameterValue(mock_mode, value_type=bool),
                 'mock_contact': True, 'mock_distance': 1.0,

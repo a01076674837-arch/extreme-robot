@@ -8,12 +8,14 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from control_msgs.action import FollowJointTrajectory
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool, Int32MultiArray, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from builtin_interfaces.msg import Duration
 
 from robot_arm_msgs.msg import ArmStatus
 from dynamixel_control.tool_profiles import validate_control_scope
+from dynamixel_control.single_motor_endpoints import (
+    load as load_single_endpoints, save as save_single_endpoint)
 
 
 ARM_JOINTS = [f'arm_joint_{index}' for index in range(1, 6)]
@@ -40,6 +42,8 @@ class ManualGuiNode(Node):
         self.declare_parameter('tool_type', 'spur_1motor_gripper')
         self.declare_parameter('control_scope', 'FULL_ROBOT')
         self.declare_parameter('temporary_jog_mode', False)
+        self.declare_parameter('dual_single_motor_test_mode', False)
+        self.declare_parameter('dual_manual_test_mode', False)
         self.declare_parameter('temporary_jog_safe_min_tick', 2867)
         self.declare_parameter('temporary_jog_safe_max_tick', 3807)
         self.declare_parameter('temporary_jog_mechanical_open_tick', 2817)
@@ -50,6 +54,10 @@ class ManualGuiNode(Node):
             self.get_parameter('control_scope').value)
         self.temporary_jog_mode = bool(
             self.get_parameter('temporary_jog_mode').value)
+        self.dual_single_motor_test_mode = bool(
+            self.get_parameter('dual_single_motor_test_mode').value)
+        self.dual_manual_test_mode = bool(
+            self.get_parameter('dual_manual_test_mode').value)
         self.temporary_jog_safe_min = int(
             self.get_parameter('temporary_jog_safe_min_tick').value)
         self.temporary_jog_safe_max = int(
@@ -60,6 +68,7 @@ class ManualGuiNode(Node):
         self.fsm_state = 'UNKNOWN'
         self.last_gripper_goal = None
         self.gripper_busy = False
+        self.single_motor_endpoints = load_single_endpoints()
 
         self.create_subscription(JointState, '/joint_states', self._joint_cb, 10)
         self.create_subscription(String, '/tool/status', self._tool_cb, 10)
@@ -77,6 +86,10 @@ class ManualGuiNode(Node):
         self.estop_pub = self.create_publisher(Bool, '/tool/emergency_stop', 10)
         self.detach_pub = self.create_publisher(Bool, '/tool/detached', 10)
         self.mode_pub = self.create_publisher(String, '/control/mode', 10)
+        self.motor_goal_pub = self.create_publisher(
+            Int32MultiArray, '/dynamixel/goal_position', 10)
+        self.endpoint_pub = self.create_publisher(
+            Int32MultiArray, '/tool/single_motor_endpoints', 10)
         self.gripper = ActionClient(
             self, FollowJointTrajectory,
             '/gripper_controller/follow_joint_trajectory')
@@ -140,6 +153,10 @@ class ManualGuiNode(Node):
                 joint: {'position': float(target_rad), 'effort': 0.0}})
 
     def command_gripper(self, position):
+        if self.dual_single_motor_test_mode:
+            self.signals.log.emit(
+                '단일 모터 시험 중에는 프리셋 그리퍼 명령을 사용할 수 없습니다')
+            return False
         if self.control_mode != 'MANUAL':
             self.signals.log.emit('Gripper command blocked: ownership is not MANUAL')
             return False
@@ -169,6 +186,35 @@ class ManualGuiNode(Node):
         future = self.gripper.send_goal_async(goal)
         future.add_done_callback(self._gripper_goal_response)
         return True
+
+    def command_single_motor_tick(self, target_tick):
+        """Publish one bounded ID3 goal for dual-profile single-motor testing."""
+        if (not self.dual_single_motor_test_mode
+                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.selected_tool != 'dual_motor_gripper'
+                or self.control_mode != 'MANUAL'):
+            self.signals.log.emit('ID3 조그 차단: 시험 모드/제어권 미준비')
+            return False
+        self.motor_goal_pub.publish(Int32MultiArray(
+            data=[3, int(target_tick)]))
+        return True
+
+    def save_single_motor_endpoint(self, kind, tick):
+        if not self.dual_single_motor_test_mode:
+            return None
+        self.single_motor_endpoints = save_single_endpoint(kind, int(tick))
+        opened = self.single_motor_endpoints.get('open_tick')
+        closed = self.single_motor_endpoints.get('close_tick')
+        if opened is not None and closed is not None:
+            self.endpoint_pub.publish(Int32MultiArray(data=[opened, closed]))
+        return dict(self.single_motor_endpoints)
+
+    def command_single_motor_preset(self, kind):
+        target = self.single_motor_endpoints.get(f'{kind}_tick')
+        if target is None:
+            self.signals.log.emit(f'{kind} 최대 위치가 저장되지 않음')
+            return False
+        return self.command_single_motor_tick(target)
 
     def _gripper_goal_response(self, future):
         try:
