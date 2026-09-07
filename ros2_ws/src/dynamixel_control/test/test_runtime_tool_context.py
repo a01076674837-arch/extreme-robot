@@ -3,6 +3,7 @@ import ast
 from pathlib import Path
 from types import SimpleNamespace
 
+from dynamixel_control.tool_fsm.cleaner_fsm import CleanerFSM
 from dynamixel_control.calibration_session import CalibrationSession
 from dynamixel_control.dual_calibration_session import DualCalibrationSession
 from dynamixel_control.dual_manual_recovery import DualManualRecovery
@@ -35,7 +36,7 @@ def test_bridge_mock_dual_spur_cleaner_dual_reuses_existing_contexts():
     for tool, ids, fsm_name in (
             ('dual_motor_gripper', [3, 4], 'DualMotorGripperFSM'),
             ('spur_1motor_gripper', [5], 'SingleMotorGripperFSM'),
-            ('cleaner', [], None),
+            ('cleaner', [], 'CleanerFSM'),
             ('dual_motor_gripper', [3, 4], 'DualMotorGripperFSM')):
         # The production switch requires the old tool to have stopped.
         if bridge.tool_fsm:

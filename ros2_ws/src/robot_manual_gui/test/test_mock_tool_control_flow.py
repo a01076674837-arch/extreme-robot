@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
 
-def test_mock_runtime_spur_manual_enable_open_close_jog(monkeypatch, tmp_path):
+def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
     import rclpy
     import yaml
     from rclpy.executors import SingleThreadedExecutor
@@ -24,6 +24,9 @@ def test_mock_runtime_spur_manual_enable_open_close_jog(monkeypatch, tmp_path):
     profiles = yaml.safe_load(source_profile.read_text())
     # A mock-only calibrated fixture must not certify the physical tool.
     profiles['tool_profiles']['spur_1motor_gripper']['calibrated'] = True
+    profiles['tool_profiles']['cleaner'].update(
+        calibrated=True, actuator_ids=[6], joint_names=['cleaning_actuator_joint'],
+        direction=-1, profile_velocity=30)
     profile_file = tmp_path / 'mock_tool_profiles.yaml'
     profile_file.write_text(yaml.safe_dump(profiles))
     rclpy.init(args=['--ros-args', '-p', 'mock_mode:=true', '-p', 'read_only:=false',
@@ -88,6 +91,44 @@ def test_mock_runtime_spur_manual_enable_open_close_jog(monkeypatch, tmp_path):
         wait_for(lambda: bridge.read_position(5) == before)
         assert set(bridge._tool_samples) == {5}
         assert window.dual_enable.isHidden()
+        window.tool_combo.setCurrentIndex(window.tool_combo.findData('cleaner'))
+        window._request_tool_change()
+        wait_for(lambda: gui.selected_tool == 'cleaner' and window.clean_start.isEnabled())
+        assert type(bridge.tool_fsm).__name__ == 'CleanerFSM'
+        assert bridge.tool_ids == gui.actuator_ids == [6]
+        assert bridge.cleaning_actuator_id == 6
+        assert bridge.cleaning_actuator_joint == 'cleaning_actuator_joint'
+        assert bridge.calibration_session is None
+        window.clean_start.click()
+        wait_for(lambda: bridge.cleaning_running and window.fsm_state == 'CLEANING')
+        assert bridge._tool_samples[6]['velocity'] == -30
+        window.clean_stop.click()
+        wait_for(lambda: not bridge.cleaning_running and window.fsm_state == 'READY')
+        assert bridge._tool_samples[6]['velocity'] == 0
+        # The existing arm mission's FSM-owned cleaning topic uses the same adapter.
+        from std_msgs.msg import Bool
+        bridge.control_mode = 'FSM'
+        bridge._on_cleaning_enable(Bool(data=True))
+        assert bridge.cleaning_running
+        bridge._on_cleaning_enable(Bool(data=False))
+        bridge.emergency_stop_active = True
+        bridge._on_cleaning_enable(Bool(data=True))
+        assert not bridge.cleaning_running
+        bridge.emergency_stop_active = False
+        bridge.control_mode = 'MANUAL'
+        window.clean_start.click()
+        wait_for(lambda: bridge.cleaning_running)
+        window.tool_combo.setCurrentIndex(window.tool_combo.findData('dual_motor_gripper'))
+        window._request_tool_change()
+        wait_for(lambda: gui.selected_tool == 'dual_motor_gripper' and window.fsm_state == 'READY')
+        assert type(bridge.tool_fsm).__name__ == 'DualMotorGripperFSM'
+        assert bridge.tool_ids == gui.actuator_ids == [3, 4]
+        assert set(bridge._tool_samples) == {3, 4}
+        assert not bridge.cleaning_running
+        assert not bridge.cleaning_configured
+        assert bridge.dual_calibration_session is not None
+        assert window.clean_start.isHidden()
+        assert not window.dual_enable.isHidden()
     finally:
         window.close()
         executor.shutdown()

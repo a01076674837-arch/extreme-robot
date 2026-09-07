@@ -545,7 +545,9 @@ class ManualMainWindow(QMainWindow):
         self.node.actuator_ids = list(self.profile.get('actuator_ids', []))
         self.profile_text.setText(ko(self._profile_summary()))
         self.status_labels['tool_type'].setText(ko(status.get('tool_type', 'UNKNOWN')))
-        if self.node.selected_tool != 'cleaner' or previous_tool != 'cleaner':
+        if (self.node.selected_tool != 'cleaner' or previous_tool != 'cleaner'
+                or status.get('fsm_state') in ('READY', 'CLEANING', 'STOPPED',
+                                               'CALIBRATION_REQUIRED')):
             self._update_fsm(status.get('fsm_state') or 'UNKNOWN')
         self._set_bool(
             self.status_labels['u2d2'], bool(status.get('u2d2_connected')))

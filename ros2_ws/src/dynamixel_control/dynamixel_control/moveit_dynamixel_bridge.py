@@ -21,6 +21,7 @@ from ament_index_python.packages import get_package_share_directory
 
 from dynamixel_control.tool_manager import (
     ParameterToolIdentityProvider, ToolManager)
+from dynamixel_control.tool_fsm.cleaner_fsm import CleanerFSM
 from dynamixel_control.tool_profiles import (
     load_profiles, ToolProfileError, validate_control_scope)
 from dynamixel_control import calib_math
@@ -493,6 +494,7 @@ class MoveItDynamixelBridge(Node):
         self.cleaning_actuator_id = int(self.get_parameter("cleaning_actuator_id").value)
         self.cleaning_direction = int(self.get_parameter("cleaning_direction").value)
         self.cleaning_velocity_raw = int(self.get_parameter("cleaning_velocity_raw").value)
+        self.cleaning_running = False
         self.cleaning_configured = (
             bool(self.cleaning_actuator_joint) and self.cleaning_actuator_id >= 0
             and self.cleaning_direction in (-1, 1) and self.cleaning_velocity_raw > 0
@@ -658,6 +660,10 @@ class MoveItDynamixelBridge(Node):
             self.dual_manual_recovery = DualManualRecovery(self)
             self.dual_calibration_session = DualCalibrationSession(
                 self, self.tool_profile)
+
+        if self.tool_type == 'cleaner':
+            self.tool_fsm = CleanerFSM(self.tool_profile, self)
+            self.tool_fsm.startup()
 
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
@@ -1669,6 +1675,11 @@ class MoveItDynamixelBridge(Node):
     def _stop_tool(self, reason):
         """Best-effort stop for emergency, detach, cancellation, and shutdown."""
         self.tool_motion_allowed = False
+        self.cleaning_running = False
+        if isinstance(getattr(self, 'tool_fsm', None), CleanerFSM):
+            self.tool_fsm.state = ToolState.STOPPED
+            for sample in self._tool_samples.values():
+                sample['velocity'] = 0
         if self.mock_mode or self.read_only:
             return
         with self._bus_lock:
@@ -1737,6 +1748,8 @@ class MoveItDynamixelBridge(Node):
         if self._gripper_goal_active:
             raise RuntimeError('runtime tool change blocked while gripper motion is active')
         old_fsm = self.tool_fsm
+        if self.tool_type == 'cleaner':
+            old_fsm = None  # Switching stops the velocity adapter before unregistering it.
         if old_fsm and old_fsm.state not in (
                 ToolState.READY, ToolState.OPEN, ToolState.CLOSED,
                 ToolState.CALIBRATION_REQUIRED, ToolState.STOPPED):
@@ -1758,8 +1771,14 @@ class MoveItDynamixelBridge(Node):
             raise ToolProfileError(
                 f'{requested} profile actuator_ids must be {expected_ids}, got {new_ids}')
 
+        if requested == 'cleaner' and new_ids:
+            if len(new_ids) != 1 or len(selection.profile.get('joint_names', [])) != 1:
+                raise ToolProfileError('cleaner requires one actuator and one joint')
+            if new_ids[0] in {config['id'] for config in JOINT_CONFIG.values()}:
+                raise ToolProfileError('cleaner actuator conflicts with an arm joint')
+
         # Stop and unregister the old tool before changing the allowlist.  This
-        # is the only deliberate hardware write in a tool-change operation.
+        # New cleaner velocity-mode setup follows discovery below.
         old_ids = list(self.tool_ids)
         old_torque_on = bool(self.torque_enabled_ids & set(old_ids))
         if old_torque_on:
@@ -1775,6 +1794,21 @@ class MoveItDynamixelBridge(Node):
                 pass
             self.active_ids.discard(dxl_id)
             self.torque_enabled_ids.discard(dxl_id)
+
+        self.cleaning_running = False
+        self.cleaning_configured = False
+        self.cleaning_actuator_id = -1
+        self.cleaning_actuator_joint = ''
+        self.cleaning_direction = 0
+        self.cleaning_velocity_raw = 0
+        if requested == 'cleaner':
+            self.cleaning_actuator_id = new_ids[0] if new_ids else -1
+            self.cleaning_actuator_joint = (selection.profile.get('joint_names') or [''])[0]
+            self.cleaning_direction = int(selection.profile.get('direction') or 0)
+            self.cleaning_velocity_raw = int(selection.profile.get('profile_velocity') or 0)
+            self.cleaning_configured = bool(
+                selection.valid and new_ids and self.cleaning_actuator_joint
+                and self.cleaning_direction in (-1, 1) and self.cleaning_velocity_raw > 0)
 
         self.tool_type = requested
         self.tool_manager = manager
@@ -1806,10 +1840,17 @@ class MoveItDynamixelBridge(Node):
         else:
             self.tool_motion_allowed = False
 
+        if (requested == 'cleaner' and self.cleaning_configured
+                and self.tool_discovered and not self.mock_mode and not self.read_only):
+            self._configure_cleaning_actuator()
+
         self._fsm_allowlist = set()
-        # Cleaner retains the existing arm mission FSM and cleaning adapter.
+        # Retain the existing mission FSM and its /cleaning/enable adapter.
         self.tool_fsm = None
-        if requested != 'cleaner':
+        if requested == 'cleaner':
+            self.tool_fsm = CleanerFSM(self.tool_profile, self)
+            self.tool_fsm.startup()
+        else:
             self.tool_fsm = manager.create_fsm(self)
             self.tool_fsm.startup()
         self.calibration_session = None
@@ -1908,6 +1949,8 @@ class MoveItDynamixelBridge(Node):
             'model': id5.get('model'),
             'fault': fsm_fault,
             'synchronization': synchronization,
+            'cleaning_running': self.cleaning_running,
+            'cleaning_configured': self.cleaning_configured,
             'tool_change': {
                 'pending': self._tool_change_pending is not None,
                 'requested': self._tool_change_pending,
@@ -1926,6 +1969,9 @@ class MoveItDynamixelBridge(Node):
             for dxl_id in self.tool_ids)
 
     def _tool_backend_ready(self):
+        if self.tool_type == 'cleaner' and self.mock_mode:
+            return bool(self.tool_motion_allowed and not self.read_only
+                        and not self.emergency_stop_active and not self.tool_detached)
         if self.tool_type == 'spur_1motor_gripper' and self.tool_ids == [5]:
             return bool(
                 self._tool_enable_allowed()
@@ -2031,13 +2077,22 @@ class MoveItDynamixelBridge(Node):
             self.cleaning_configured = False
 
     def _on_cleaning_enable(self, msg):
-        if (self.read_only or self.mock_mode or not self.cleaning_configured
-                or self.tool_type != 'cleaner'
-                or self.control_mode != 'MANUAL'
-                or not self._tool_backend_ready()):
-            if msg.data:
-                self.get_logger().error(
-                    "Cleaning command rejected: actuator ID/direction/velocity not configured")
+        if self.tool_type != 'cleaner' or self.read_only:
+            return
+        if msg.data and (self.emergency_stop_active or self.tool_detached
+                         or not self.tool_motion_allowed
+                         or self.control_mode not in ('MANUAL', 'FSM')):
+            return
+        if self.mock_mode:
+            self.cleaning_running = bool(msg.data)
+            if isinstance(self.tool_fsm, CleanerFSM):
+                self.tool_fsm.observe_command(msg.data)
+            for sample in self._tool_samples.values():
+                sample['velocity'] = (self.cleaning_direction * self.cleaning_velocity_raw
+                                      if msg.data else 0)
+            return
+        if not self.cleaning_configured or (msg.data and not self._tool_backend_ready()):
+            self.get_logger().error('Cleaning actuator/profile is not ready')
             return
         velocity = self.cleaning_direction * self.cleaning_velocity_raw if msg.data else 0
         result, error = self.packet_handler.write4ByteTxRx(
@@ -2046,6 +2101,10 @@ class MoveItDynamixelBridge(Node):
         if result != 0 or error != 0:
             self.get_logger().error(
                 f"Cleaning velocity write failed: result={result}, error={error}")
+            return
+        self.cleaning_running = bool(msg.data)
+        if isinstance(self.tool_fsm, CleanerFSM):
+            self.tool_fsm.observe_command(msg.data)
 
     def rad_to_tick(self, joint_name, rad):
         """관절 rad → 서보 tick. 안전 리밋 clamp 후 기어비를 곱해 서보축 도메인으로 올린다.
