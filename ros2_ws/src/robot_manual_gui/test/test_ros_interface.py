@@ -113,7 +113,7 @@ def _window(scope):
     app = QApplication.instance() or QApplication([])
     goals = []
     node = SimpleNamespace(
-        control_scope=scope, selected_tool='dual_motor_gripper',
+        control_scope=scope, selected_tool='dual_motor_gripper', read_only=False,
         positions={}, efforts={}, gripper_busy=False,
         request_mode=lambda _mode: None, jog_arm=lambda *_args: None,
         command_arm=lambda *_args: None,
@@ -410,9 +410,9 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
                     window.jog_close.click()
                     window.jog_open.click()
                     window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
-                    assert commands == [('jog_motor_degrees', {'delta_deg': -0.5}),
-                                        ('jog_motor_degrees', {'delta_deg': 0.5}),
-                                        ('jog_motor_degrees', {'delta_deg': -0.5})]
+                    assert commands == [('manual_open', {}), ('manual_hold', {}),
+                                        ('manual_close', {}), ('manual_hold', {}),
+                                        ('manual_step', {'delta_deg': -0.5})]
                     assert not window.gripper_target_ticks
             app.processEvents()
         assert requests == ['spur_1motor_gripper', 'cleaner', 'dual_motor_gripper']
@@ -491,3 +491,69 @@ def test_bridge_accepts_ready_manual_request_without_motor_commands():
     namespace['_on_control_mode_request'](bridge, SimpleNamespace(data='MANUAL'))
     assert bridge.control_mode == 'MANUAL'
     assert published[0].data == 'MANUAL'
+
+
+def test_status_panel_follows_active_tool_and_clears_missing_id5_feedback():
+    app, window, commands = _window('END_EFFECTOR_ONLY')
+    try:
+        for tool in ('dual_motor_gripper', 'spur_1motor_gripper', 'cleaner',
+                     'spur_1motor_gripper', 'dual_motor_gripper'):
+            window.node.selected_tool = tool
+            window._update_status_panel({'actuators': [dict(
+                id=5, online=True, position=2965, torque_state='OFF',
+                hardware_error=0, operating_mode=3)]})
+            for key in ('dual_online', 'dual_positions', 'dual_torque', 'dual_hw_error', 'dual_sync'):
+                assert window.status_labels[key].isHidden() == (tool != 'dual_motor_gripper')
+                assert window.status_titles[key].isHidden() == (tool != 'dual_motor_gripper')
+            for key in ('spur_online', 'spur_position', 'spur_torque', 'spur_hw_error', 'spur_operating_mode'):
+                assert window.status_labels[key].isHidden() == (tool != 'spur_1motor_gripper')
+                assert window.status_titles[key].isHidden() == (tool != 'spur_1motor_gripper')
+            if tool == 'spur_1motor_gripper':
+                assert window.status_labels['spur_position'].text() == '2965'
+                assert window.status_labels['spur_hw_error'].text() == '0'
+                assert window.status_labels['spur_operating_mode'].text() == '3 (위치 제어)'
+                window._update_status_panel({'actuators': [dict(id=3, position=123)]})
+                assert window.status_labels['spur_position'].text() != '2965'
+        assert commands == []
+    finally:
+        window.close()
+
+
+def test_spur_enable_uses_current_context_before_motion_allowed():
+    app, window, commands = _window('END_EFFECTOR_ONLY')
+    window.node.command_calibration = lambda command, **values: (commands.append(command) or True)
+    buttons = window._common_buttons()
+    try:
+        window.control_mode = window.node.control_mode = 'FSM'
+        window.pending_tool_change = 'spur_1motor_gripper'
+        status = _ready_status('END_EFFECTOR_ONLY')
+        status.update(tool_type='spur_1motor_gripper', control_mode='MANUAL',
+                      motion_allowed=False, calibration={'active': False, 'enabled': False},
+                      tool_profile={'actuator_ids': [5], 'calibrated': True,
+                                    'open_tick': 2945, 'close_tick': 3752,
+                                    'safe_min_tick': 2945, 'safe_max_tick': 3752},
+                      actuators=[dict(id=5, online=True, hardware_error=0,
+                                      position=3000, torque_state='OFF', operating_mode=3)])
+        window._update_tool_status(status)
+        assert window._common_buttons() == buttons
+        assert window.control_mode == window.node.control_mode == 'MANUAL'
+        assert window.common_enable.isEnabled()
+        assert not window.open_button.isEnabled()
+        window.common_enable.click()
+        assert commands == ['manual_enable']
+        status['actuators'][0]['torque_state'] = 'ON'
+        # Deliberately leave motion_allowed false: torque readback is authoritative.
+        window._update_tool_status(status)
+        assert not window.common_enable.isEnabled()
+        assert all(w.isEnabled() for w in (window.open_button, window.close_button,
+                                          window.hold_open_button, window.hold_close_button))
+        window.open_button.click()
+        window.close_button.click()
+        window.hold_open_button.click()
+        assert commands == ['manual_enable', 'OPEN', 'CLOSE', 'manual_open', 'manual_hold']
+        status['control_mode'] = 'FSM'
+        window._update_tool_status(status)
+        assert not window.common_enable.isEnabled()
+        assert not window.open_button.isEnabled()
+    finally:
+        window.close()

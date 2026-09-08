@@ -22,6 +22,7 @@ from ament_index_python.packages import get_package_share_directory
 from dynamixel_control.tool_manager import (
     ParameterToolIdentityProvider, ToolManager)
 from dynamixel_control.tool_fsm.cleaner_fsm import CleanerFSM
+from dynamixel_control.spur_manual_control import SpurManualControl
 from dynamixel_control.tool_profiles import (
     load_profiles, ToolProfileError, validate_control_scope)
 from dynamixel_control import calib_math
@@ -665,6 +666,9 @@ class MoveItDynamixelBridge(Node):
             self.tool_fsm = CleanerFSM(self.tool_profile, self)
             self.tool_fsm.startup()
 
+        self.spur_manual_control = SpurManualControl(self)
+        self.create_timer(0.1, self._spur_manual_watchdog)
+
         self.trajectory_sub = self.create_subscription(
             JointTrajectory,
             "/arm_controller/joint_trajectory",
@@ -1125,6 +1129,13 @@ class MoveItDynamixelBridge(Node):
         self.tool_motion_allowed = selection.valid
         self.dual_calibration_session.reload(self.tool_profile)
 
+    def _spur_manual_watchdog(self):
+        try:
+            with self._bus_lock:
+                self.spur_manual_control.watchdog()
+        except Exception as exc:
+            self.get_logger().warn(f'ID5 manual HOLD failed: {exc}')
+
     def calibration_command_callback(self, msg):
         """Narrow JSON ingress for one CalibrationSession operation at a time."""
         session = self.calibration_session
@@ -1134,6 +1145,10 @@ class MoveItDynamixelBridge(Node):
         try:
             request = json.loads(msg.data)
             command = str(request['command']).lower()
+            if command.startswith('manual_'):
+                with self._bus_lock:
+                    self.spur_manual_control.command(command, request.get('delta_deg', 0))
+                return
             operations = {
                 'start': session.start, 'stop': session.stop,
                 'enable': session.enable, 'disable': session.disable,
@@ -1810,6 +1825,8 @@ class MoveItDynamixelBridge(Node):
                 selection.valid and new_ids and self.cleaning_actuator_joint
                 and self.cleaning_direction in (-1, 1) and self.cleaning_velocity_raw > 0)
 
+        if hasattr(self, 'spur_manual_control'):
+            self.spur_manual_control.deadline = None
         self.tool_type = requested
         self.tool_manager = manager
         self.tool_selection = selection

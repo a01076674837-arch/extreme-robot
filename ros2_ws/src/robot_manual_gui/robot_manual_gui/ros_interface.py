@@ -119,6 +119,8 @@ class ManualGuiNode(Node):
         self.signals.fsm_state.emit(msg.data)
 
     def _mode_cb(self, msg):
+        if self.selected_tool == 'spur_1motor_gripper':
+            self.get_logger().info(f'MODE_STATUS_RECEIVED {msg.data}')
         self.control_mode = msg.data
         self.signals.control_mode.emit(msg.data)
 

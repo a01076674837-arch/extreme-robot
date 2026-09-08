@@ -1,7 +1,7 @@
 tool_profiles:
   spur_1motor_gripper:
     backend: gripper
-    calibrated: false
+    calibrated: true
     actuator_ids: [5]
     joint_names: [gripper_drive_joint]
     # Endpoint-only manual calibration (effort/grasp calibration remains pending).

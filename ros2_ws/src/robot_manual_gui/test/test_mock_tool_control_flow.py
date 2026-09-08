@@ -54,6 +54,7 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
 
     try:
         wait_for(lambda: window.fsm_state == 'READY')
+        common_buttons = window._common_buttons()
         window.tool_combo.setCurrentIndex(window.tool_combo.findData('spur_1motor_gripper'))
         next(b for b in window.findChildren(QPushButton)
              if b.text() == ko('REQUEST TOOL CHANGE')).click()
@@ -71,7 +72,7 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         window.mock_mode = True
         # Reuse the existing explicit session-start requirement for ENABLE.
         wait_for(lambda: window.start_cal.isEnabled())
-        window.start_cal.click()
+        # Shared ENABLE works without starting calibration.
         wait_for(lambda: window.spur_enable.isEnabled())
         window.spur_enable.click()
         wait_for(lambda: bridge.read_torque(5) == 1 and window.spur_torque_state == 'ON')
@@ -83,14 +84,19 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         window.close_button.click()
         wait_for(lambda: window.fsm_state == 'CLOSED')
         assert bridge.read_position(5) == bridge.tool_profile['close_tick']
+        # Normal manual routing must not depend on a calibration session.
+        bridge.calibration_session.active = False
+        bridge.calibration_session.enabled = False
+        wait_for(lambda: not window.tool_status['calibration']['active'])
         before = bridge.read_position(5)
         assert window.motor_minus_half.isEnabled()
         window.motor_minus_half.click()
         wait_for(lambda: bridge.read_position(5) == before - 6)
-        window.jog_open.click()
+        window.hold_close_button.click()
         wait_for(lambda: bridge.read_position(5) == before)
         assert set(bridge._tool_samples) == {5}
-        assert window.dual_enable.isHidden()
+        assert window._common_buttons() == common_buttons
+        assert window.common_enable is window.spur_enable is window.dual_enable
         window.tool_combo.setCurrentIndex(window.tool_combo.findData('cleaner'))
         window._request_tool_change()
         wait_for(lambda: gui.selected_tool == 'cleaner' and window.clean_start.isEnabled())
@@ -129,6 +135,16 @@ def test_mock_runtime_dual_spur_cleaner_round_trip(monkeypatch, tmp_path):
         assert bridge.dual_calibration_session is not None
         assert window.clean_start.isHidden()
         assert not window.dual_enable.isHidden()
+        assert window._common_buttons() == common_buttons
+        window.common_enable.click()
+        wait_for(lambda: bridge.read_torque(3) == bridge.read_torque(4) == 1
+                 and window.open_button.isEnabled())
+        window.open_button.click()
+        wait_for(lambda: window.fsm_state == 'OPEN')
+        window.close_button.click()
+        wait_for(lambda: window.fsm_state == 'CLOSED')
+        window.common_disable.click()
+        wait_for(lambda: bridge.read_torque(3) == bridge.read_torque(4) == 0)
     finally:
         window.close()
         executor.shutdown()

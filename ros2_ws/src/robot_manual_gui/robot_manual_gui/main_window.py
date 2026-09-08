@@ -1,6 +1,7 @@
 """PyQt5 widgets for manual robot validation."""
 
 import time
+import json
 
 from PyQt5.QtCore import QEvent, QLibraryInfo, QProcess, QTimer, QTranslator, Qt
 from PyQt5.QtWidgets import (
@@ -33,6 +34,10 @@ class ManualMainWindow(QMainWindow):
         self.mock_mode = mock_mode
         self.tool_status = {}
         self.pending_tool_change = None
+        self.spur_hold_command = None
+        self.spur_hold_timer = QTimer(self)
+        self.spur_hold_timer.setInterval(100)
+        self.spur_hold_timer.timeout.connect(self._repeat_spur_hold)
         self.fsm_state = 'UNKNOWN'
         self.control_mode = 'FSM'
         self.last_status_time = 0.0
@@ -143,6 +148,7 @@ class ManualMainWindow(QMainWindow):
         box = QGroupBox(ko('Connection / Status'))
         form = QFormLayout(box)
         self.status_labels = {}
+        self.status_titles = {}
         for key, title in (
                 ('connection', 'Bridge connection'),
                 ('u2d2', 'U2D2 / serial'), ('tool_type', 'Tool type'),
@@ -156,11 +162,49 @@ class ManualMainWindow(QMainWindow):
                 ('dual_torque', 'ID3 / ID4 torque'),
                 ('dual_hw_error', 'ID3 / ID4 hardware error'),
                 ('dual_sync', 'Dual synchronization'),
+                ('spur_online', 'ID5 연결'),
+                ('spur_position', 'ID5 위치 (틱)'),
+                ('spur_torque', 'ID5 토크'),
+                ('spur_hw_error', 'ID5 하드웨어 오류'),
+                ('spur_operating_mode', 'ID5 운전 모드'),
                 ('contact', 'Contact sensor')):
             label = QLabel(ko('UNKNOWN'))
             self.status_labels[key] = label
-            form.addRow(ko(title), label)
+            title_label = QLabel(ko(title))
+            self.status_titles[key] = title_label
+            form.addRow(title_label, label)
+        self._update_status_panel({})
         return box
+
+    def _update_status_panel(self, status):
+        """Display-only selection; never publish a motor or ownership command."""
+        tool = self.node.selected_tool
+        for key, label in self.status_labels.items():
+            visible = (tool == 'dual_motor_gripper' if key.startswith('dual_')
+                       else tool == 'spur_1motor_gripper' if key.startswith('spur_')
+                       else True)
+            if tool == 'spur_1motor_gripper':
+                visible = key.startswith('spur_') or key == 'fsm'
+            label.setVisible(visible)
+            self.status_titles[key].setVisible(visible)
+        if hasattr(self, 'diag'):
+            self.diag.setVisible(tool != 'spur_1motor_gripper')
+        sample = next((item for item in status.get('actuators', [])
+                       if item.get('id') == 5), {}) if tool == 'spur_1motor_gripper' else {}
+        for key, field in (('spur_online', 'online'), ('spur_position', 'position'),
+                           ('spur_torque', 'torque_state'), ('spur_hw_error', 'hardware_error'),
+                           ('spur_operating_mode', 'operating_mode')):
+            value = sample.get(field)
+            if value is None:
+                text = 'UNKNOWN'
+            elif field == 'online':
+                text = '연결됨' if value else '연결 끊김'
+            elif field == 'operating_mode':
+                text = {1: '1 (속도 제어)', 3: '3 (위치 제어)',
+                        4: '4 (확장 위치 제어)', 5: '5 (전류 기반 위치 제어)'}.get(value, str(value))
+            else:
+                text = str(value)
+            self.status_labels[key].setText(ko(text))
 
     def _arm_group(self):
         box = QGroupBox(ko('Arm Manual Control'))
@@ -243,45 +287,32 @@ class ManualMainWindow(QMainWindow):
         self.profile_text = QLabel(ko(self._profile_summary()))
         self.profile_text.setWordWrap(True)
         layout.addWidget(self.profile_text)
-        row = QHBoxLayout()
-        self.open_button = QPushButton(ko('OPEN'))
-        self.close_button = QPushButton(ko('CLOSE'))
-        self.tool_stop = QPushButton(ko('STOP'))
-        self.open_button.clicked.connect(lambda: self._command_tool('OPEN'))
-        self.close_button.clicked.connect(lambda: self._command_tool('CLOSE'))
-        self.tool_stop.clicked.connect(self._stop_tool)
-        row.addWidget(self.open_button)
-        row.addWidget(self.close_button)
-        row.addWidget(self.tool_stop)
-        layout.addLayout(row)
-        self.hold_open_button = QPushButton(ko('HOLD TO OPEN'))
-        self.hold_close_button = QPushButton(ko('HOLD TO CLOSE'))
-        self.hold_open_button.setAutoRepeat(False)
-        self.hold_close_button.setAutoRepeat(False)
-        self.hold_open_button.pressed.connect(
-            lambda: self._start_dual_hold_jog('OPEN'))
-        self.hold_close_button.pressed.connect(
-            lambda: self._start_dual_hold_jog('CLOSE'))
-        self.hold_open_button.released.connect(self._release_dual_hold_jog)
-        self.hold_close_button.released.connect(self._release_dual_hold_jog)
-        hold_row = QHBoxLayout()
-        hold_row.addWidget(self.hold_open_button)
-        hold_row.addWidget(self.hold_close_button)
-        layout.addLayout(hold_row)
-        self.spur_enable = QPushButton(ko('ENABLE ID5'))
-        self.spur_disable = QPushButton(ko('DISABLE ID5'))
-        self.spur_enable.clicked.connect(self._enable_spur_motor)
-        self.spur_disable.clicked.connect(self._disable_spur_motor)
-        enable_row = QHBoxLayout()
-        enable_row.addWidget(self.spur_enable)
-        enable_row.addWidget(self.spur_disable)
-        self.dual_enable = QPushButton(ko('ENABLE ID3/ID4'))
-        self.dual_disable = QPushButton(ko('DISABLE ID3/ID4'))
-        self.dual_enable.clicked.connect(self._enable_dual_motors)
-        self.dual_disable.clicked.connect(self._disable_dual_motors)
-        enable_row.addWidget(self.dual_enable)
-        enable_row.addWidget(self.dual_disable)
-        layout.addLayout(enable_row)
+        if not hasattr(self, 'common_enable'):
+            self.open_button = QPushButton(ko('OPEN'))
+            self.close_button = QPushButton(ko('CLOSE'))
+            self.tool_stop = QPushButton(ko('STOP'))
+            self.hold_open_button = QPushButton(ko('HOLD TO OPEN'))
+            self.hold_close_button = QPushButton(ko('HOLD TO CLOSE'))
+            self.common_enable = QPushButton('활성화')
+            self.common_disable = QPushButton('비활성화')
+            self.open_button.clicked.connect(lambda: self._command_tool('OPEN'))
+            self.close_button.clicked.connect(lambda: self._command_tool('CLOSE'))
+            self.tool_stop.clicked.connect(self._stop_tool)
+            self.common_enable.clicked.connect(lambda: self._common_torque(True))
+            self.common_disable.clicked.connect(lambda: self._common_torque(False))
+            self.hold_open_button.pressed.connect(lambda: self._common_hold('OPEN'))
+            self.hold_close_button.pressed.connect(lambda: self._common_hold('CLOSE'))
+            self.hold_open_button.released.connect(self._common_release)
+            self.hold_close_button.released.connect(self._common_release)
+            self.spur_enable = self.dual_enable = self.common_enable
+            self.spur_disable = self.dual_disable = self.common_disable
+        for widgets in ((self.open_button, self.close_button, self.tool_stop),
+                        (self.hold_open_button, self.hold_close_button),
+                        (self.common_enable, self.common_disable)):
+            row = QHBoxLayout()
+            for widget in widgets:
+                row.addWidget(widget)
+            layout.addLayout(row)
         self.dual_recovery_buttons = []
         if self.node.selected_tool == 'dual_motor_gripper':
             recovery = QGroupBox(ko('MANUAL DUAL MOTOR RECOVERY (one click only)'))
@@ -350,7 +381,7 @@ class ManualMainWindow(QMainWindow):
         jog_layout = QGridLayout(jog)
         self.spur_minus_5 = self.spur_zero = self.spur_plus_5 = None
         if self.node.selected_tool == 'spur_1motor_gripper':
-            left_label, right_label = 'ID5 MOTOR −0.5°', 'ID5 MOTOR +0.5°'
+            left_label, right_label = '누르는 동안 열기 (열림 끝점 방향)', '누르는 동안 닫기 (닫힘 끝점 방향)'
         else:
             left_label, right_label = 'LEFT / +  (OPEN)', 'RIGHT / −  (CLOSE)'
         self.jog_close = QPushButton(ko(left_label))
@@ -370,8 +401,14 @@ class ManualMainWindow(QMainWindow):
         if self.node.selected_tool == 'spur_1motor_gripper':
             shortcut.setText(ko('Left: ID5 −0.5° / Right: ID5 +0.5° / Space: STOP'))
         shortcut.setWordWrap(True)
-        self.jog_close.clicked.connect(lambda: self._jog_gripper(-1))
-        self.jog_open.clicked.connect(lambda: self._jog_gripper(1))
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            self.jog_close.pressed.connect(lambda: self._start_spur_hold('manual_open'))
+            self.jog_open.pressed.connect(lambda: self._start_spur_hold('manual_close'))
+            self.jog_close.released.connect(self._release_spur_hold)
+            self.jog_open.released.connect(self._release_spur_hold)
+        else:
+            self.jog_close.clicked.connect(lambda: self._jog_gripper(-1))
+            self.jog_open.clicked.connect(lambda: self._jog_gripper(1))
         jog_layout.addWidget(self.jog_close, 0, 0)
         jog_layout.addWidget(self.jog_open, 0, 1)
         step_label = ('Motor step' if self.node.selected_tool == 'spur_1motor_gripper'
@@ -460,6 +497,105 @@ class ManualMainWindow(QMainWindow):
         self.clean_stop.setVisible(not (dual or spur))
         return box
 
+    def _common_buttons(self):
+        return (self.open_button, self.close_button, self.tool_stop,
+                self.common_enable, self.common_disable,
+                self.hold_open_button, self.hold_close_button)
+
+    def _common_torque(self, enabled):
+        if self.node.selected_tool == 'dual_motor_gripper':
+            (self._enable_dual_motors if enabled else self._disable_dual_motors)()
+        elif self.node.selected_tool == 'spur_1motor_gripper':
+            self.node.command_calibration('manual_enable' if enabled else 'manual_disable')
+
+    def _common_hold(self, direction):
+        if self.node.selected_tool == 'dual_motor_gripper':
+            self._start_dual_hold_jog(direction)
+        elif self.node.selected_tool == 'spur_1motor_gripper':
+            self._start_spur_hold('manual_open' if direction == 'OPEN' else 'manual_close')
+
+    def _common_release(self):
+        if self.node.selected_tool == 'dual_motor_gripper':
+            self._release_dual_hold_jog()
+        elif self.node.selected_tool == 'spur_1motor_gripper':
+            self._release_spur_hold()
+
+    def _spur_enable_ready(self):
+        status = self.tool_status
+        sample = self._gripper_samples().get(5, {})
+        return bool(self.node.selected_tool == 'spur_1motor_gripper'
+                    and status.get('tool_type') == 'spur_1motor_gripper'
+                    and self.pending_tool_change is None
+                    and self.control_mode == 'MANUAL'
+                    and self.node.control_scope == 'END_EFFECTOR_ONLY'
+                    and time.monotonic() - self.last_status_time < 1.5
+                    and not status.get('read_only') and not getattr(self.node, 'read_only', False)
+                    and not status.get('emergency_stop') and not status.get('tool_detached')
+                    and sample.get('online') and sample.get('hardware_error') == 0
+                    and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
+
+    def _refresh_common_buttons(self):
+        tool = self.node.selected_tool
+        for widget in self._common_buttons():
+            widget.setVisible(tool in ('dual_motor_gripper', 'spur_1motor_gripper'))
+        if tool != 'spur_1motor_gripper':
+            # The existing dual gates above are authoritative, unchanged.
+            return
+        sample = self._gripper_samples().get(5, {})
+        ready = self._spur_enable_ready()
+        torque_on = sample.get('torque_state') == 'ON'
+        # Torque-off readiness must never depend on motion_allowed or calibration-session state.
+        self.common_enable.setEnabled(ready and not torque_on)
+        motion = ready and torque_on
+        for widget in (self.open_button, self.close_button,
+                       self.hold_open_button, self.hold_close_button):
+            widget.setEnabled(motion)
+        writable = (not self.tool_status.get('read_only')
+                    and not getattr(self.node, 'read_only', False))
+        self.common_disable.setEnabled(bool(sample.get('online') and writable and torque_on))
+        self.tool_stop.setEnabled(bool(sample.get('online') and writable))
+        self._log_spur_enable_diagnostics()
+
+    def _log_spur_enable_diagnostics(self):
+        status = self.tool_status
+        sample = self._gripper_samples().get(5, {})
+        gates = {
+            'selected_spur': self.node.selected_tool == 'spur_1motor_gripper',
+            'reported_spur': status.get('tool_type') == 'spur_1motor_gripper',
+            'no_pending_change': self.pending_tool_change is None,
+            'manual': self.control_mode == 'MANUAL',
+            'scope': self.node.control_scope == 'END_EFFECTOR_ONLY',
+            'fresh': time.monotonic() - self.last_status_time < 1.5,
+            'bridge_writable': not bool(status.get('read_only')),
+            'gui_writable': not getattr(self.node, 'read_only', False),
+            'no_estop': not bool(status.get('emergency_stop')),
+            'attached': not bool(status.get('tool_detached')),
+            'online': bool(sample.get('online')),
+            'hw_error_zero': sample.get('hardware_error') == 0,
+            'fsm_ready': self.fsm_state in ('READY', 'OPEN', 'CLOSED'),
+            'torque_not_on': sample.get('torque_state') != 'ON',
+        }
+        parents = []
+        parent = self.common_enable.parentWidget()
+        while parent is not None:
+            parents.append({'class': type(parent).__name__, 'enabled': parent.isEnabled()})
+            parent = parent.parentWidget()
+        record = {
+            'selected_tool': self.node.selected_tool, 'control_mode': self.control_mode,
+            'node_control_mode': getattr(self.node, 'control_mode', None), 'fsm_state': self.fsm_state,
+            'id5': sample, 'mode_combo': self.mode_combo.currentData(),
+            'tool_status': {k: status.get(k) for k in ('tool_type', 'control_mode',
+                'fsm_state', 'tool_enable_allowed', 'motion_allowed', 'profile_valid', 'calibrated')},
+            'enable_conditions': gates, 'setEnabled_argument': all(gates.values()),
+            'button_isEnabled': self.common_enable.isEnabled(), 'parents': parents,
+        }
+        encoded = json.dumps(record, sort_keys=True, ensure_ascii=False)
+        if encoded != getattr(self, '_last_enable_diagnostics', None):
+            self._last_enable_diagnostics = encoded
+            logger = getattr(self.node, 'get_logger', None)
+            if logger:
+                logger().info('SPUR_ENABLE_DIAGNOSTICS ' + encoded)
+
     def _profile_summary(self):
         keys = ('calibrated', 'actuator_ids', 'safe_min_tick', 'safe_max_tick',
                 'open_tick', 'close_tick', 'profile_velocity',
@@ -469,6 +605,8 @@ class ManualMainWindow(QMainWindow):
     def _rebuild_tool_control_group(self):
         old = getattr(self, 'tool_control_box', None)
         if old is not None:
+            for widget in self._common_buttons():
+                widget.setParent(None)
             self.right_layout.removeWidget(old)
             old.setEnabled(False)
             old.hide()
@@ -525,6 +663,8 @@ class ManualMainWindow(QMainWindow):
         if self.node.selected_tool != previous_tool:
             # The bridge already stopped the old tool. Do not send HOLD to
             # the newly selected tool from an old timer/release callback.
+            self.spur_hold_timer.stop()
+            self.spur_hold_command = None
             self.dual_key_jog_timer.stop()
             self.dual_key_jog_direction = 0
             self.dual_hold_jog_active = False
@@ -541,6 +681,13 @@ class ManualMainWindow(QMainWindow):
                 self.status_labels[key].setText('—')
             self.tool_combo.setCurrentIndex(self.tool_combo.findData(self.node.selected_tool))
             self._rebuild_tool_control_group()
+        if self.node.selected_tool == 'spur_1motor_gripper':
+            # Mode-status is event-only; recover the current mode from periodic tool context.
+            mode = status.get('control_mode')
+            if mode in ('MANUAL', 'FSM'):
+                self.control_mode = self.node.control_mode = mode
+                self.status_labels['mode'].setText(ko(mode))
+        self._update_status_panel(status)
         self.node.tool_profile = self.profile
         self.node.actuator_ids = list(self.profile.get('actuator_ids', []))
         self.profile_text.setText(ko(self._profile_summary()))
@@ -776,8 +923,19 @@ class ManualMainWindow(QMainWindow):
                            self.motor_minus_one, self.motor_plus_one,
                            self.capture_open, self.capture_close):
                 widget.setEnabled(calibration_ready)
-            self.jog_close.setEnabled(calibration_ready)
-            self.jog_open.setEnabled(calibration_ready)
+            manual_ready = self._spur_manual_ready()
+            opening = self.profile.get('open_tick')
+            closing = self.profile.get('close_tick')
+            if isinstance(opening, (int, float)) and isinstance(closing, (int, float)):
+                self.jog_close.setText(f'누르는 동안 열기 (틱 {"감소" if opening < closing else "증가"} → {opening})')
+                self.jog_open.setText(f'누르는 동안 닫기 (틱 {"증가" if opening < closing else "감소"} → {closing})')
+            self.open_button.setEnabled(manual_ready)
+            self.close_button.setEnabled(manual_ready)
+            self.jog_close.setEnabled(manual_ready)
+            self.jog_open.setEnabled(manual_ready)
+            for widget in (self.motor_minus_half, self.motor_plus_half,
+                           self.motor_minus_one, self.motor_plus_one):
+                widget.setEnabled(manual_ready)
             self.gripper_jog_step.setEnabled(False)
             captures = calibration.get('captures', {})
             both_captured = (set(captures) == {'open', 'close'}
@@ -791,6 +949,50 @@ class ManualMainWindow(QMainWindow):
         self.start_cal.setEnabled(
             spur and manual and bool(self.tool_status.get('calibration_jog_enabled'))
             and not calibration.get('active', False))
+        self._refresh_common_buttons()
+
+    def _spur_manual_ready(self):
+        return (self._spur_enable_ready()
+                and self._gripper_samples().get(5, {}).get('torque_state') == 'ON')
+
+    def _common_motion_ready(self):
+        status = self.tool_status
+        ids = self.profile.get('actuator_ids', [])
+        samples = self._gripper_samples()
+        return bool(self.node.selected_tool in ('dual_motor_gripper', 'spur_1motor_gripper')
+                    and self.pending_tool_change is None
+                    and self.control_mode == 'MANUAL'
+                    and self.node.control_scope == 'END_EFFECTOR_ONLY'
+                    and time.monotonic() - self.last_status_time < 1.5
+                    and status.get('tool_type') == self.node.selected_tool
+                    and status.get('profile_valid') and status.get('calibrated')
+                    and not status.get('read_only') and not getattr(self.node, 'read_only', False)
+                    and not status.get('emergency_stop') and not status.get('tool_detached')
+                    and ids and all(samples.get(i, {}).get('online')
+                        and samples[i].get('hardware_error') == 0
+                        and samples[i].get('torque_state') == 'ON' for i in ids)
+                    and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
+
+    def _start_spur_hold(self, command):
+        if not self._spur_manual_ready():
+            return
+        self.spur_hold_command = command
+        self._repeat_spur_hold()
+        self.spur_hold_timer.start()
+
+    def _repeat_spur_hold(self):
+        if not self._spur_manual_ready():
+            self._release_spur_hold()
+            return
+        if self.spur_hold_command:
+            self.node.command_calibration(self.spur_hold_command)
+
+    def _release_spur_hold(self):
+        self.spur_hold_timer.stop()
+        active = self.spur_hold_command is not None
+        self.spur_hold_command = None
+        if active and self.node.selected_tool == 'spur_1motor_gripper':
+            self.node.command_calibration('manual_hold')
 
     def _tool_motion_ready(self):
         fresh = time.monotonic() - self.last_status_time < 1.5
@@ -1046,7 +1248,7 @@ class ManualMainWindow(QMainWindow):
         if current is None or self.spur_torque_state != 'ON':
             self._append_log('Motor jog blocked: ID5 position/actual torque unavailable')
             return
-        if self.node.command_calibration('jog_motor_degrees', delta_deg=float(degrees)):
+        if self._spur_manual_ready() and self.node.command_calibration('manual_step', delta_deg=float(degrees)):
             self._append_log(f'ID5 CalibrationSession jog {degrees:+.1f}° requested')
 
     def _capture_spur_endpoint(self, label):
@@ -1190,6 +1392,8 @@ class ManualMainWindow(QMainWindow):
         super().keyPressEvent(event)
 
     def eventFilter(self, watched, event):
+        if event.type() == QEvent.WindowDeactivate and watched is self:
+            self._release_spur_hold()
         if (event.type() == QEvent.WindowDeactivate
                 and watched is self and self.dual_key_jog_timer.isActive()):
             self._stop_dual_key_jog()
@@ -1265,6 +1469,7 @@ class ManualMainWindow(QMainWindow):
         self._append_log('Dual jog released: current-position HOLD requested')
 
     def closeEvent(self, event):
+        self._release_spur_hold()
         if self.dual_key_jog_timer.isActive():
             self._stop_dual_key_jog()
         super().closeEvent(event)
