@@ -217,10 +217,11 @@ class ManualGuiNode(Node):
             self.signals.log.emit('FSM command blocked: GUI is read-only')
             return False
         if (self.selected_tool not in (
-                    'spur_1motor_gripper', 'dual_motor_gripper')
-                or self.control_scope != 'END_EFFECTOR_ONLY'):
+                    'spur_1motor_gripper', 'dual_motor_gripper', 'cleaner')
+                or self.control_scope not in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')):
             return False
-        self.fsm_command_pub.publish(String(data=str(command).upper()))
+        self.fsm_command_pub.publish(String(data=json.dumps({
+            'tool_type': self.selected_tool, 'command': str(command).upper()})))
         return True
 
     def request_tool_change(self, tool_type):
@@ -242,7 +243,9 @@ class ManualGuiNode(Node):
             self.signals.log.emit('Calibration command blocked: GUI is read-only')
             return False
         if (self.selected_tool != 'spur_1motor_gripper'
-                or self.control_scope != 'END_EFFECTOR_ONLY'):
+                or (self.control_scope != 'END_EFFECTOR_ONLY' and not (
+                    self.control_scope == 'FULL_ROBOT'
+                    and command in ('manual_enable', 'manual_disable')))):
             return False
         payload = {'command': command, **values}
         self.calibration_command_pub.publish(String(data=json.dumps(payload)))
@@ -255,7 +258,7 @@ class ManualGuiNode(Node):
             self.signals.log.emit('Dual torque request blocked: GUI is read-only')
             return False
         if (self.selected_tool != 'dual_motor_gripper'
-                or self.control_scope != 'END_EFFECTOR_ONLY'
+                or self.control_scope not in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                 or ids != [3, 4]):
             self.signals.log.emit('Dual torque request blocked: expected IDs [3, 4]')
             return False

@@ -4,7 +4,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
@@ -12,6 +12,8 @@ from launch_ros.substitutions import FindPackageShare
 
 def generate_launch_description():
     mock_mode = LaunchConfiguration('mock_mode')
+    start_moveit = LaunchConfiguration('start_moveit')
+    profile_file = LaunchConfiguration('tool_profile_file')
     read_only = LaunchConfiguration('read_only')
     start_stack = LaunchConfiguration('start_stack')
     start_fsm = LaunchConfiguration('start_fsm')
@@ -36,6 +38,7 @@ def generate_launch_description():
             'interchangeable_tool.launch.py'])),
         launch_arguments={
             'mock_mode': mock_mode,
+            'tool_profile_file': profile_file,
             'start_fsm': start_fsm,
             'read_only': read_only,
             'tool_type': tool_type,
@@ -58,19 +61,32 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('mock_mode', default_value='true'),
         DeclareLaunchArgument(
+            'tool_profile_file', default_value=PathJoinSubstitution([
+                FindPackageShare('dynamixel_control'), 'config', PythonExpression([
+                    "'tool_profiles.mock.yaml' if '", mock_mode,
+                    "'.lower() == 'true' else 'tool_profiles.yaml'"])])),
+        DeclareLaunchArgument(
+            'start_moveit', default_value='true',
+            description='Start the persistent arm MoveIt/TF stack; false when already running.'),
+        *[IncludeLaunchDescription(
+            PythonLaunchDescriptionSource(PathJoinSubstitution([
+                FindPackageShare('robot_arm_moveit_config'), 'launch', filename])),
+            condition=IfCondition(start_moveit))
+          for filename in ('rsp.launch.py', 'move_group.launch.py')],
+        DeclareLaunchArgument(
             'read_only', default_value='true',
             description='Hardware launch defaults to no actuator writes.'),
         DeclareLaunchArgument(
             'start_stack', default_value='true',
             description='Set false when bridge/FSM are already running.'),
         DeclareLaunchArgument(
-            'start_fsm', default_value='false',
-            description='The bridge owns the ID5 tool FSM; arm_fsm is not needed for END_EFFECTOR_ONLY.'),
+            'start_fsm', default_value='true',
+            description='Keep the arm mission FSM connected to the selected tool context.'),
         DeclareLaunchArgument(
-            'tool_type', default_value='spur_1motor_gripper'),
+            'tool_type', default_value='dual_motor_gripper'),
         DeclareLaunchArgument(
-            'control_scope', default_value='END_EFFECTOR_ONLY',
-            description='Defaults to ID5-only END_EFFECTOR_ONLY; FULL_ROBOT is explicit.'),
+            'control_scope', default_value='FULL_ROBOT',
+            description='Arm joints 1–5 and the interchangeable tool share one bridge.'),
         DeclareLaunchArgument(
             'gripper_target_tolerance_ticks', default_value='20'),
         DeclareLaunchArgument('temporary_jog_mode', default_value='false'),

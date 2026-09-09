@@ -11,7 +11,9 @@ class SpurManualControl:
         b = self.bridge
         if b.tool_type != 'spur_1motor_gripper' or b.tool_ids != [5] or b.read_only:
             raise RuntimeError('ID5 manual scope/read-only gate')
-        if b.control_scope != 'END_EFFECTOR_ONLY':
+        if b.control_scope != 'END_EFFECTOR_ONLY' and not (
+                b.control_scope == 'FULL_ROBOT'
+                and command in ('manual_enable', 'manual_disable')):
             raise RuntimeError('ID5 requires end-effector scope')
         if command == 'manual_disable':
             self.deadline = None

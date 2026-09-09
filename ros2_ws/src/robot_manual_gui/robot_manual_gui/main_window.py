@@ -39,6 +39,7 @@ class ManualMainWindow(QMainWindow):
         self.spur_hold_timer.setInterval(100)
         self.spur_hold_timer.timeout.connect(self._repeat_spur_hold)
         self.fsm_state = 'UNKNOWN'
+        self.arm_fsm_state = 'UNKNOWN'
         self.control_mode = 'FSM'
         self.last_status_time = 0.0
         self.processes = []
@@ -156,7 +157,7 @@ class ManualMainWindow(QMainWindow):
                 ('calibration_valid', 'Calibration / endpoints valid'),
                 ('actuators_discovered', 'Actuators discovered'),
                 ('motion_allowed', 'Motion allowed'), ('fsm', 'FSM state'),
-                ('arm_status', 'Arm contract state'), ('mode', 'Control mode'),
+                ('arm_fsm', '팔 FSM'), ('arm_status', 'Arm contract state'), ('mode', 'Control mode'),
                 ('dual_online', 'ID3 / ID4 online'),
                 ('dual_positions', 'ID3 / ID4 positions'),
                 ('dual_torque', 'ID3 / ID4 torque'),
@@ -295,8 +296,8 @@ class ManualMainWindow(QMainWindow):
             self.hold_close_button = QPushButton(ko('HOLD TO CLOSE'))
             self.common_enable = QPushButton('활성화')
             self.common_disable = QPushButton('비활성화')
-            self.open_button.clicked.connect(lambda: self._command_tool('OPEN'))
-            self.close_button.clicked.connect(lambda: self._command_tool('CLOSE'))
+            self.open_button.clicked.connect(lambda: self._common_action(2))
+            self.close_button.clicked.connect(lambda: self._common_action(1))
             self.tool_stop.clicked.connect(self._stop_tool)
             self.common_enable.clicked.connect(lambda: self._common_torque(True))
             self.common_disable.clicked.connect(lambda: self._common_torque(False))
@@ -306,7 +307,7 @@ class ManualMainWindow(QMainWindow):
             self.hold_close_button.released.connect(self._common_release)
             self.spur_enable = self.dual_enable = self.common_enable
             self.spur_disable = self.dual_disable = self.common_disable
-        for widgets in ((self.open_button, self.close_button, self.tool_stop),
+        for widgets in ((self.close_button, self.open_button, self.tool_stop),
                         (self.hold_open_button, self.hold_close_button),
                         (self.common_enable, self.common_disable)):
             row = QHBoxLayout()
@@ -527,14 +528,47 @@ class ManualMainWindow(QMainWindow):
                     and status.get('tool_type') == 'spur_1motor_gripper'
                     and self.pending_tool_change is None
                     and self.control_mode == 'MANUAL'
-                    and self.node.control_scope == 'END_EFFECTOR_ONLY'
+                    and self.node.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                     and time.monotonic() - self.last_status_time < 1.5
                     and not status.get('read_only') and not getattr(self.node, 'read_only', False)
                     and not status.get('emergency_stop') and not status.get('tool_detached')
                     and sample.get('online') and sample.get('hardware_error') == 0
                     and self.fsm_state in ('READY', 'OPEN', 'CLOSED'))
 
+    def _common_action(self, number):
+        if self.pending_tool_change:
+            return
+        command = (('LEFT', 'RIGHT') if self.node.selected_tool == 'cleaner'
+                   else ('CLOSE', 'OPEN'))[number - 1]
+        self.node.command_tool_fsm(command)
+
     def _refresh_common_buttons(self):
+        self._refresh_legacy_common_buttons()
+        cleaner = self.node.selected_tool == 'cleaner'
+        self.close_button.setText('버튼 1 · 좌회전' if cleaner else '버튼 1 · 집는 방향')
+        self.open_button.setText('버튼 2 · 우회전' if cleaner else '버튼 2 · 여는 방향')
+        self.close_button.setVisible(True)
+        self.open_button.setVisible(True)
+        self.tool_stop.setVisible(True)
+        self.clean_start.hide()
+        self.clean_stop.hide()
+        if cleaner:
+            ready = (self.control_mode == 'MANUAL' and self._tool_motion_ready()
+                     and bool(self.profile.get('actuator_ids'))
+                     and bool(self.tool_status.get('actuators_discovered'))
+                     and not self.pending_tool_change)
+            self.close_button.setEnabled(ready)
+            self.open_button.setEnabled(ready)
+            self.tool_stop.setEnabled(not self.tool_status.get('read_only'))
+        # The integrated operator panel exposes exactly two motion buttons.
+        # Bench calibration/recovery widgets remain available in bench scope.
+        if self.node.control_scope == 'FULL_ROBOT':
+            allowed = {self.close_button, self.open_button, self.tool_stop,
+                       self.common_enable, self.common_disable, self.read_diag}
+            for button in self.tool_control_box.findChildren(QPushButton):
+                button.setVisible(button in allowed)
+
+    def _refresh_legacy_common_buttons(self):
         tool = self.node.selected_tool
         for widget in self._common_buttons():
             widget.setVisible(tool in ('dual_motor_gripper', 'spur_1motor_gripper'))
@@ -740,8 +774,8 @@ class ManualMainWindow(QMainWindow):
         self._rebuild_diagnostics(self.tool_status.get('actuators', []), values)
 
     def _update_mission_fsm(self, state):
-        if self.node.selected_tool == 'cleaner':
-            self._update_fsm(state)
+        self.arm_fsm_state = state
+        self.status_labels['arm_fsm'].setText(ko(state))
 
     def _update_fsm(self, state):
         self.fsm_state = state
@@ -1491,7 +1525,8 @@ class ManualMainWindow(QMainWindow):
             f'Mode request clicked: requested={requested}, '
             f'approved={self.control_mode}')
         if (not self.mock_mode and requested == 'MANUAL'
-                and self.fsm_state not in ToolManager.SAFE_CHANGE_STATES
+                and (self.arm_fsm_state if self.node.control_scope == 'FULL_ROBOT'
+                     else self.fsm_state) not in ToolManager.SAFE_CHANGE_STATES
                 and not (self.node.selected_tool == 'spur_1motor_gripper'
                          and self.fsm_state in ('CALIBRATION_REQUIRED', 'STOPPED', 'READY'))
                 and not (self.node.selected_tool == 'dual_motor_gripper'

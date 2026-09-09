@@ -62,6 +62,8 @@ def validate_profile(tool_type, profile, mock_mode=False):
         errors.append(f'backend must be {expected_backend!r}')
     if mock_mode:
         return errors
+    if profile.get('mock_only'):
+        errors.append('mock_only profile cannot control physical hardware')
     if not profile.get('calibrated', False):
         errors.append('calibrated must be true')
     ids = profile.get('actuator_ids')

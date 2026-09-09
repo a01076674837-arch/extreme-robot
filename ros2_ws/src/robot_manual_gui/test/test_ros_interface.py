@@ -345,7 +345,7 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
     try:
         for tool, ids in [('dual_motor_gripper', [3, 4]),
                           ('spur_1motor_gripper', [5]),
-                          ('cleaner', []), ('dual_motor_gripper', [3, 4])]:
+                          ('cleaner', [6]), ('dual_motor_gripper', [3, 4])]:
             old_panel = window.tool_control_box
             changed = window.node.selected_tool != tool
             if changed:
@@ -382,14 +382,14 @@ def test_mock_runtime_round_trip_routes_buttons_keys_and_clears_context():
                 assert not window.dual_hold_jog_active
             commands.clear()
             if tool == 'cleaner':
-                assert window.open_button.isHidden()
+                assert not window.open_button.isHidden()
                 assert window.spur_enable.isHidden()
                 assert window.dual_enable.isHidden()
-                window.clean_start.click()
-                window.clean_stop.click()
+                window.close_button.click()
+                window.open_button.click()
                 window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Space, Qt.NoModifier))
                 window.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_Left, Qt.NoModifier))
-                assert commands == [('cleaner', True), ('cleaner', False), ('cleaner', False)]
+                assert commands == ['LEFT', 'RIGHT', ('cleaner', False)]
                 assert window.spur_actual_state is None
                 assert window.motor_minus_half is None
             else:

@@ -397,6 +397,10 @@ class MoveItDynamixelBridge(Node):
         self.declare_parameter("cleaning_direction", 0)
         self.declare_parameter("cleaning_velocity_raw", 0)
 
+        self.declare_parameter('centers', EMPTY_STR_ARRAY)
+        self.declare_parameter('gear_ratios', EMPTY_STR_ARRAY)
+        self.centers = _parse_centers(self.get_parameter('centers').value)
+        self.gear_ratios = _parse_gear_ratios(self.get_parameter('gear_ratios').value)
         self.gripper_joints = list(self.get_parameter("gripper_joints").value)
         self.gripper_ids = list(self.get_parameter("gripper_ids").value)
         self.gripper_open_rad = float(self.get_parameter("gripper_open_rad").value)
@@ -484,6 +488,8 @@ class MoveItDynamixelBridge(Node):
             self.tool_selection = None
             self.tool_profile = {}
             self.tool_motion_allowed = False
+        if self.tool_profile.get('mock_only') and not self.mock_mode:
+            raise RuntimeError('mock_only profiles cannot open physical hardware')
         self.control_mode = 'FSM'
         self.emergency_stop_active = False
         self.tool_detached = False
@@ -495,6 +501,15 @@ class MoveItDynamixelBridge(Node):
         self.cleaning_actuator_id = int(self.get_parameter("cleaning_actuator_id").value)
         self.cleaning_direction = int(self.get_parameter("cleaning_direction").value)
         self.cleaning_velocity_raw = int(self.get_parameter("cleaning_velocity_raw").value)
+        if self.tool_type == 'cleaner' and self.tool_profile.get('actuator_ids'):
+            ids = self.tool_profile['actuator_ids']
+            joints = self.tool_profile.get('joint_names', [])
+            if len(ids) != 1 or len(joints) != 1 or ids[0] in ARM_IDS:
+                raise ToolProfileError('cleaner requires one non-arm actuator and one joint')
+            self.cleaning_actuator_id = ids[0]
+            self.cleaning_actuator_joint = joints[0]
+            self.cleaning_direction = int(self.tool_profile.get('direction') or 0)
+            self.cleaning_velocity_raw = int(self.tool_profile.get('profile_velocity') or 0)
         self.cleaning_running = False
         self.cleaning_configured = (
             bool(self.cleaning_actuator_joint) and self.cleaning_actuator_id >= 0
@@ -570,6 +585,12 @@ class MoveItDynamixelBridge(Node):
         # gripper-only/read-only에서는 register write 없이 그리퍼 ID만 active_ids에 등록된다.
         self.active_ids = set()
         self.torque_enabled_ids = set()
+        self._mock_arm_positions = {name: 0.0 for name in JOINT_CONFIG}
+        if self.control_scope == 'FULL_ROBOT' and (self.mock_mode or self.read_only):
+            for config in JOINT_CONFIG.values():
+                self.active_ids.add(config['id'])
+                if not self.mock_mode and self.port_connected:
+                    self.group_sync_read.addParam(config['id'])
 
         if not self.read_only and not self.mock_mode:
             if self.control_scope == 'FULL_ROBOT':
@@ -584,6 +605,7 @@ class MoveItDynamixelBridge(Node):
         self.tool_ids = list(self.tool_profile.get('actuator_ids', []))
         self.tool_discovered = self.mock_mode
         if self.mock_mode:
+            self.active_ids.update(self.tool_ids)
             # Provide a deterministic, in-range feedback sample so the GUI can
             # capture its zero/reference without touching a serial device.
             joint_names = self.tool_profile.get('joint_names') or ['']
@@ -900,7 +922,7 @@ class MoveItDynamixelBridge(Node):
         if enable and self.tool_type == 'dual_motor_gripper':
             samples = [self._tool_samples.get(dxl_id, {}) for dxl_id in (3, 4)]
             dual_enable_ready = (
-                ids == [3, 4] and self.control_scope == 'END_EFFECTOR_ONLY'
+                ids == [3, 4] and self.control_scope in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                 and self._tool_enable_allowed()
                 and all(sample.get('online')
                         and sample.get('hardware_error') == 0
@@ -1029,17 +1051,29 @@ class MoveItDynamixelBridge(Node):
 
     def fsm_command_callback(self, msg):
         """Route normal OPEN/CLOSE/STOP only to the selected tool FSM."""
+        command = str(msg.data).strip().upper()
+        if str(msg.data).lstrip().startswith('{'):
+            try:
+                request = json.loads(msg.data)
+                if request['tool_type'] != self.tool_type:
+                    self.get_logger().warn('Ignoring command from a replaced tool context')
+                    return
+                command = str(request['command']).strip().upper()
+            except (ValueError, KeyError, TypeError):
+                return
+        if self.tool_type == 'cleaner':
+            self._cleaner_direction_command(command)
+            return
         if self.tool_fsm is None or self.tool_type not in (
                 'spur_1motor_gripper', 'dual_motor_gripper'):
             self.get_logger().warn('tool FSM command rejected: no gripper FSM')
             return
-        command = str(msg.data).strip().upper()
         stopping = command in ('STOP', 'DISABLE')
         if self.read_only:
             self.get_logger().warn('tool FSM command rejected: bridge is read-only')
             return
         if (not stopping and (
-                self.control_scope != 'END_EFFECTOR_ONLY'
+                self.control_scope not in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                 or self.control_mode != 'MANUAL'
                 or self.emergency_stop_active or self.tool_detached)):
             self.get_logger().warn('tool FSM command rejected by ingress safety gate')
@@ -1522,6 +1556,9 @@ class MoveItDynamixelBridge(Node):
         self.get_logger().info(f"Torque enabled safely: {label} -> id {dxl_id}")
         return True
 
+    def _joint_center(self, joint_name):
+        return self.centers.get(joint_name, JOINT_CONFIG[joint_name]['center'])
+
     def _joint_gear_ratio(self, joint_name):
         """실측으로 덮어쓸 수 있는 기어비(`gear_ratios` 파라미터 > JOINT_CONFIG 기본값)."""
         return self.gear_ratios.get(joint_name, JOINT_CONFIG[joint_name]["gear_ratio"])
@@ -1795,7 +1832,10 @@ class MoveItDynamixelBridge(Node):
         # Stop and unregister the old tool before changing the allowlist.  This
         # New cleaner velocity-mode setup follows discovery below.
         old_ids = list(self.tool_ids)
-        old_torque_on = bool(self.torque_enabled_ids & set(old_ids))
+        old_torque_on = (bool(self.torque_enabled_ids & set(old_ids))
+                         or bool(getattr(self, 'cleaning_running', False))
+                         or any(sample.get('torque_state') == 'ON'
+                                for sample in getattr(self, '_tool_samples', {}).values()))
         if old_torque_on:
             self._stop_tool(f'runtime tool change to {requested}')
         else:
@@ -1832,10 +1872,15 @@ class MoveItDynamixelBridge(Node):
         self.tool_selection = selection
         self.tool_profile = selection.profile
         self.tool_ids = new_ids
+        self.gripper_ids = new_ids if requested != 'cleaner' else []
+        self.gripper_joints = list(self.tool_profile.get('joint_names', []))
+        self.gripper_open_rad = float(self.tool_profile.get('open_position', 1.0))
+        self.gripper_close_rad = float(self.tool_profile.get('close_position', 0.0))
         self.tool_motion_allowed = bool(selection.valid)
         self.tool_discovered = self.mock_mode
         self._tool_samples = {}
         if self.mock_mode:
+            self.active_ids.update(self.tool_ids)
             joint_names = self.tool_profile.get('joint_names') or ['']
             endpoints = self.tool_profile.get('motor_endpoints') or {}
             for dxl_id in self.tool_ids:
@@ -2093,7 +2138,18 @@ class MoveItDynamixelBridge(Node):
         else:
             self.cleaning_configured = False
 
-    def _on_cleaning_enable(self, msg):
+    def _cleaner_direction_command(self, command):
+        if command == 'STOP':
+            self._on_cleaning_enable(Bool(data=False))
+            return
+        if command not in ('LEFT', 'RIGHT') or self.control_mode != 'MANUAL':
+            return
+        if not self.cleaning_configured or not self.tool_discovered:
+            self.get_logger().warn('Cleaner direction command requires a configured actuator')
+            return
+        self._on_cleaning_enable(Bool(data=True), 1 if command == 'LEFT' else -1)
+
+    def _on_cleaning_enable(self, msg, rotation=1):
         if self.tool_type != 'cleaner' or self.read_only:
             return
         if msg.data and (self.emergency_stop_active or self.tool_detached
@@ -2105,13 +2161,13 @@ class MoveItDynamixelBridge(Node):
             if isinstance(self.tool_fsm, CleanerFSM):
                 self.tool_fsm.observe_command(msg.data)
             for sample in self._tool_samples.values():
-                sample['velocity'] = (self.cleaning_direction * self.cleaning_velocity_raw
+                sample['velocity'] = (rotation * self.cleaning_direction * self.cleaning_velocity_raw
                                       if msg.data else 0)
             return
         if not self.cleaning_configured or (msg.data and not self._tool_backend_ready()):
             self.get_logger().error('Cleaning actuator/profile is not ready')
             return
-        velocity = self.cleaning_direction * self.cleaning_velocity_raw if msg.data else 0
+        velocity = rotation * self.cleaning_direction * self.cleaning_velocity_raw if msg.data else 0
         result, error = self.packet_handler.write4ByteTxRx(
             self.port_handler, self.cleaning_actuator_id, ADDR_GOAL_VELOCITY,
             velocity & 0xffffffff)
@@ -2573,7 +2629,7 @@ class MoveItDynamixelBridge(Node):
         if (self.tool_type != 'dual_motor_gripper' or self.tool_ids != [3, 4]
                 or set(targets) != {3, 4}):
             raise RuntimeError('dual FSM target set must be exactly IDs [3, 4]')
-        if (self.control_scope != 'END_EFFECTOR_ONLY'
+        if (self.control_scope not in ('END_EFFECTOR_ONLY', 'FULL_ROBOT')
                 or self.control_mode != 'MANUAL'
                 or not self._tool_backend_ready()
                 or self.emergency_stop_active or self.tool_detached):
@@ -2735,6 +2791,13 @@ class MoveItDynamixelBridge(Node):
             self.get_logger().warn("JointTrajectory names/positions length mismatch")
             return
 
+        if self.mock_mode:
+            for name, rad in zip(msg.joint_names, point.positions):
+                if name in self._mock_arm_positions:
+                    self._mock_arm_positions[name] = self.tick_to_rad(
+                        name, self.rad_to_tick(name, rad))
+            return
+
         self.group_sync_write.clearParam()
         added_any = False
 
@@ -2776,7 +2839,18 @@ class MoveItDynamixelBridge(Node):
     # ------------------------------------------------------------------ feedback
     def publish_joint_states(self):
         if self.mock_mode:
-            self.joint_state_pub.publish(JointState())
+            msg = JointState()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            if self.control_scope == 'FULL_ROBOT':
+                msg.name = list(self._mock_arm_positions)
+                msg.position = list(self._mock_arm_positions.values())
+                msg.effort = [0.0] * len(msg.name)
+            for joint in self.tool_profile.get('joint_names', []):
+                sample = next(iter(self._tool_samples.values()), {})
+                msg.name.append(joint)
+                msg.position.append(float(sample.get('position', 0)) * 2 * math.pi / 4096)
+                msg.effort.append(float(sample.get('effort', 0)))
+            self.joint_state_pub.publish(msg)
             self.fault_pub.publish(Bool(data=False))
             return
         if not self.port_connected:
@@ -2825,7 +2899,7 @@ class MoveItDynamixelBridge(Node):
                     'effort': None, 'online': False}
             else:
                 load_raw, tick, hw_error = sample
-                tick = self._tool_position_tick(dxl_id, tick)
+                tick = self._tool_position_tick(self.cleaning_actuator_id, tick)
                 fault = fault or hw_error != 0
                 self._tool_samples[self.cleaning_actuator_id] = {
                     'id': self.cleaning_actuator_id,

@@ -248,6 +248,7 @@ from dynamixel_control.contract import (       # noqa: E402
 )
 from dynamixel_control.qos_profiles import HEARTBEAT_QOS, ARRIVAL_QOS   # noqa: E402
 from dynamixel_control.sensor_manager import SensorManager              # noqa: E402
+from robot_arm_msgs.msg import TaskCommand, TaskResult
 from dynamixel_control.tool_manager import (                            # noqa: E402
     ParameterToolIdentityProvider, ToolManager)
 from dynamixel_control.tool_profiles import (                           # noqa: E402
@@ -333,6 +334,17 @@ class ArmFsmNode(Node):
         # ── 파라미터 ──────────────────────────────
         # 형상과 tip_link를 포함한 모든 엔드이펙터 기본값을 같은 preset에서 고른다.
         self.declare_parameter('end_effector_preset', DEFAULT_GRIPPER)
+        self.declare_parameter('cleaning_actuator_joint', '')
+        self.cleaning_actuator_joint = self.get_parameter('cleaning_actuator_joint').value
+        self.declare_parameter('dry_run_mode', False)
+        self.declare_parameter('vla_standalone_mode', False)
+        self.dry_run_mode = bool(self.get_parameter('dry_run_mode').value)
+        self.vla_standalone_mode = bool(self.get_parameter('vla_standalone_mode').value)
+        self.declare_parameter('vla_command_topic', '/vla/task_command')
+        self.declare_parameter('vla_result_topic', '/vla/task_result')
+        self.declare_parameter('tool_type', 'dual_motor_gripper')
+        self.declare_parameter('tool_profile_file', str(Path(
+            get_package_share_directory('dynamixel_control')) / 'config/tool_profiles.yaml'))
         gripper_type = self.get_parameter('end_effector_preset').value
         gpreset = get_preset(gripper_type, self.get_logger())
 
@@ -684,6 +696,17 @@ class ArmFsmNode(Node):
         self.tool_type = ''
         self._tool_status = None
         self._tool_status_stamp = None
+        self.selected_tool_type = self.get_parameter('tool_type').value
+        manager = ToolManager(
+            load_profiles(self.get_parameter('tool_profile_file').value),
+            ParameterToolIdentityProvider(self.selected_tool_type),
+            mock_mode=self.dry_run_mode)
+        selection = manager.refresh('IDLE')
+        self.tool_profile = selection.profile
+        self.tool_profile_valid = selection.valid
+        self.create_subscription(String, '/tool/status', self._on_runtime_tool_status, 10)
+        self.create_subscription(String, '/control/mode', self._on_mode_request, 10)
+
         self._gripper_command_state = 'idle'
         self._gripper_command_ok = False
         self.control_mode = 'FSM'
@@ -760,6 +783,50 @@ class ArmFsmNode(Node):
             f'tool_profile_valid={self.tool_profile_valid}, '
             f'heartbeat={HEARTBEAT_RATE_HZ}Hz)'
         )
+
+    def _on_mode_request(self, msg):
+        mode = msg.data.strip().upper()
+        if mode in ('MANUAL', 'FSM'):
+            self.control_mode = mode
+            self.pub_control_mode.publish(String(data=mode))
+
+    def _on_runtime_tool_status(self, msg):
+        try:
+            status = json.loads(msg.data)
+            tool = status['tool_type']
+            profile = status['tool_profile']
+            if tool not in ('dual_motor_gripper', 'spur_1motor_gripper', 'cleaner'):
+                return
+        except (ValueError, KeyError, TypeError):
+            return
+        # Only the tool context changes. Arm state, joint feedback and MoveIt
+        # clients remain owned by this same node for its entire lifetime.
+        changed = tool != self.selected_tool_type
+        self.selected_tool_type = tool
+        self.tool_profile = dict(profile)
+        self.tool_profile_valid = bool(status.get('profile_valid'))
+        self._tool_status = status
+        self._tool_status_stamp = self.get_clock().now()
+        if changed:
+            self._gripper_command_state = 'idle'
+            self._gripper_command_ok = False
+            self._grip_hold_target = None
+            self.gripper_joints = list(profile.get('joint_names', []))
+            self.gripper_open = float(profile.get('open_position', 1.0))
+            self.gripper_close = float(profile.get('close_position', 0.0))
+            if profile.get('action_time') is not None:
+                self.gripper_action_time = float(profile['action_time'])
+            self.cleaning_actuator_joint = (
+                (profile.get('joint_names') or [''])[0] if tool == 'cleaner' else '')
+
+    def _tool_ready(self):
+        if self._tool_status_stamp is None:
+            return False
+        age = (self.get_clock().now() - self._tool_status_stamp).nanoseconds / 1e9
+        return bool(age < 1.5 and self.tool_profile_valid
+                    and self._tool_status.get('motion_allowed')
+                    and not self._tool_status.get('emergency_stop')
+                    and not self._tool_status.get('tool_detached'))
 
     # ── 콜백 ───────────────────────────────────
 
